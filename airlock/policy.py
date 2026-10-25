@@ -119,6 +119,8 @@ class Policy:
         dest = self.raw.get("destinations", "block")
         dest = "off" if dest is False else str(dest).lower()            # YAML 1.1 reads a bare `off` as false
         self.destinations = dest if dest in ("block", "approve", "off") else "block"
+        dest_follow = str(self.raw.get("destinations_follow", "allow")).lower()
+        self.destinations_follow = dest_follow if dest_follow in ("allow", "approve") else "allow"
         breaker = self.raw.get("breaker", 3)
         try:                                              # a count: not yes/no, not .inf; only 0 switches it off
             self.breaker = 3 if isinstance(breaker, bool) else int(breaker)

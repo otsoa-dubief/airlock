@@ -35,13 +35,14 @@ Categories: `message`, `network_write`, `publish`, `remote`, `install`, `persist
 `browser_input`, `exfil_url`, `detach`, `written_script`, `unadmitted_tool`, `bypass`. Walls are not a category:
 they always block.
 
-## `secrets_out`, `canary`, `destinations`, `breaker`
+## `secrets_out`, `canary`, `destinations`, `destinations_follow`, `breaker`
 
 | Key | Default | Meaning |
 |---|---|---|
 | `secrets_out` | `block` | A recognized secret (private key, AWS, GitHub, GitLab, OpenAI, OpenRouter, Anthropic, DeepSeek, Groq, xAI, Perplexity, Slack, Stripe, Google, Telegram, Hugging Face, npm token, JWT) in a call that leaves the machine: `block` or `approve` |
 | `canary` | `true` | A private marker in the agent's context every turn (stored in airlock's data directory). In a tool call, it blocks the call and locks the conversation |
 | `destinations` | `block` | After untrusted content, a call that leaves to a host or address this content named: `block`, `approve` or `off`. Common hosts (GitHub, Google, PyPI...) and the pages read themselves (the source, search results) are not counted |
+| `destinations_follow` | `allow` | A bare page load or fetch of a host the untrusted content named, with no data in the URL itself: `allow` keeps merely-followed links free, `approve` asks on every one |
 | `breaker` | `3` | Refused calls in a tainted conversation before it is locked until the owner clears it; `0` never locks |
 
 ## `approvals_off`

@@ -717,12 +717,16 @@ def _decide(pol, tool, args, ctx, texts):
             sends = any(c in OUTBOUND for c, _, _ in found)
             carries = sends or text or tool == "browser_exec" or any(
                 "?" in u or ("#" in u and "=" in u.split("#", 1)[1]) for u in tool_urls(tool, args))
-            if carries:
-                level = "approve" if (mail or not sends or pol.destinations == "approve") else "block"
+            follow = pol.destinations_follow == "approve" and bool(tool_urls(tool, args))
+            if carries or follow:
+                if carries:
+                    level = "approve" if (mail or not sends or pol.destinations == "approve") else "block"
+                else:
+                    level = "approve"
                 destination = Decision(level, "destination", f"reaches {address}, an address named by the untrusted "
-                                                             "content this conversation read: the signature of an "
-                                                             "injected instruction. If it is legitimate, the owner can "
-                                                             "trust the domain or clear the conversation",
+                                                             f"content this conversation read: the signature of an "
+                                                             f"injected instruction. If it is legitimate, the owner can "
+                                                             f"trust the domain or clear the conversation",
                                        "destination", level == "block")
     for cat, reason, rule in found:
         level = pol.action(cat, bool(ctx.tainted))

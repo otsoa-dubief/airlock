@@ -28,6 +28,7 @@ def test_case(case, make_ctx, tmp_path):
     if case.get("admit_mcp"):
         pol.admitted_mcp.add(case["admit_mcp"])
     pol.trusted_domains += case.get("trusted", [])
+    pol.destinations_follow = case.get("follow", "allow")
     cwd = os.path.join(HOME, "project")
     if case.get("files"):
         cwd = str(tmp_path)

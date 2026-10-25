@@ -70,6 +70,9 @@ policy file: they can switch airlock off.
   read, but it is not a shell interpreter. Report anything that slips through (see [SECURITY.md](../SECURITY.md)),
   with the exact tool call.
 - **A user who edits the policy.** The policy is yours. airlock keeps the agent from editing it, not you.
+- **The bare-path leak.** A URL with no query or fragment to a host the untrusted content named is allowed by
+  default: merely-followed links must stay free, or research stops being possible. The same reach still asks with
+  data in the URL, through the shell, or as a write. To close the bare-path line, set `destinations_follow: approve`.
 
 ## Recommended setup around airlock
 

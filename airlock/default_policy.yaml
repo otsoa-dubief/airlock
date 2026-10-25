@@ -50,6 +50,10 @@ canary: true
 # approve, or off.
 destinations: block
 
+# A bare load or fetch of a host the untrusted content named: allow (default, merely-followed links stay free)
+# or approve (every such call asks).
+destinations_follow: allow
+
 # Refused calls in a tainted conversation before it is locked until the owner reviews it (0 = never lock).
 breaker: 3
 

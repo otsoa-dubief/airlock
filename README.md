@@ -29,7 +29,8 @@ it, the post to the webhook waits at Hermes's own approval menu; the owner picks
 - **Walls that hold in every session.** Credentials (`~/.ssh`, `~/.aws`, `.env`, browser profiles, Hermes's own
   `auth.json`...), the guard itself and Hermes's configuration (readable, never writable by the agent), shell and
   login startup files, other Hermes profiles on the same machine, commands that would switch the guard or the
-  approvals off, catastrophic deletions.
+  approvals off, catastrophic deletions, a call that names the cloud metadata service handing out a server's credentials. A file
+  behind a wall cannot be attached to a message sent with `send_message` either.
 - **Reads commands the way the shell does.** Quotes, variables, `eval`, `base64 | sh`, `curl | bash`, process
   substitution, aliases, wildcard program names, `sh -c`, `find -exec`, heredocs, inline Python, Perl, Ruby and
   Node: a command that computes or hides what it runs is refused with a short note asking the agent to write it in
@@ -72,6 +73,35 @@ writes what it would have done to its journal (`hermes airlock log`).
 executed, journaled or tainted.
 
 <p align="center"><img src="docs/images/demo.gif" alt="hermes airlock demo: an agent reads a pricing page hiding instructions; the conversation is sealed; sending the SSH key is blocked, planting a memory rule and leaking a token in a URL ask the owner, the disguised retry is blocked, the summary is written." width="100%"></p>
+
+## An ordinary session
+
+How often does airlock ask? A real session, not simulated: Hermes Agent 0.22.2 with airlock 0.2.2 in enforce mode,
+`claude-haiku-5-5`, a small Python repository with one failing test. The task: *run the test suite; fix `dates.py`
+so ISO dates with a time part parse (check the Python docs for `datetime.fromisoformat`); rerun the tests; commit
+and push; tell me what changed.*
+
+| # | The agent's call (each row is one tool call) | airlock |
+|---|---|---|
+| 1 | `git status && git branch && git remote -v && ls -la && find ...` | free |
+| 2 | reads the Python docs page (`web_extract`) | free; the conversation is now sealed (untrusted content read) |
+| 3 | `cat dates.py && cat test_dates.py && cat README.md && python3 -m pytest -q` | free |
+| 4 | opens the same docs page in the browser | free |
+| 5 | patches `dates.py` | free |
+| 6 | `python3 -m pytest -q; git config user.name; ...` | free |
+| 7 | `git status -sb && git log --oneline -3 && git diff --stat` | free |
+| 8 | `git add dates.py && git commit ... && git push origin main` | **asks you**: publishes outside this machine |
+| 9 | `git add dates.py && git commit ...` (the same, without the push) | free |
+
+Nine calls, one question, at the moment code was about to leave the machine. Reading the web, editing files, running
+tests and committing locally stay quiet, sealed conversation or not. The run was unattended (`hermes chat -q`), so
+nobody could approve call 8 and it did not run: the agent said so, committed without pushing, and left the push to
+the owner.
+
+In an earlier run of the same task the agent wrote a command with a variable as its program
+(`V=.../venv; $V/bin/python -m pytest`). airlock refused it as a computed command, the agent wrote the path in
+clear on the next call, and the session went on. That refusal is the cost of reading commands the way the shell
+does; it happens when an agent writes one, not on every task.
 
 ## How it decides
 

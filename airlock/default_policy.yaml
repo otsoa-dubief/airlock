@@ -131,6 +131,10 @@ walls:
     - '(^|/)(design[_-]?)?tokens\.(json|ya?ml)$'
   # Other Hermes profiles on this machine stay out of reach of each other.
   isolate_profiles: true
+  # Cloud metadata services (169.254.169.254, metadata.google.internal...) hand this server's credentials to whoever
+  # asks from inside it: a command, code, a page load or a third-party tool that names one in the call itself is
+  # refused. Messages, notes and files may mention them, and so may a command whose programs only read or file text.
+  cloud_metadata: true
   # Words or patterns the agent must never use in a command, a file it writes or a message (regular expressions,
   # case-insensitive). Typical use: another client's or another company's name. Empty by default.
   words: []

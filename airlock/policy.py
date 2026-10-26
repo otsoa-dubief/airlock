@@ -66,6 +66,7 @@ class Policy:
         self.secret_except = self._compile(walls.get("secret_files_except") or [], "walls.secret_files_except",
                                            flags=secret_flags)
         self.isolate_profiles = bool(walls.get("isolate_profiles", True))
+        self.cloud_metadata = bool(walls.get("cloud_metadata", True))
         self.words = self._compile(walls.get("words") or [], "walls.words", flags=re.I)
         self.commands = []
         for c in walls.get("commands") or []:

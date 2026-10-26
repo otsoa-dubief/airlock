@@ -28,7 +28,7 @@ from . import rules
 
 logger = logging.getLogger(__name__)
 PLUGIN = "airlock"
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 AUTHOR = "Otsoa Dubief"
 HERE = os.path.dirname(os.path.abspath(__file__))
 _lock = threading.RLock()
@@ -45,6 +45,8 @@ class State:
         self.parents = {}         # child session -> parent session
         self.written = {}         # session -> set of paths
         self.pages = {}           # session -> host of the last page browser_navigate opened
+        self.warned_reader = False  # the missing Hermes attachment reader was reported once
+        self.reader = None          # Hermes's attachment reader once imported, False when it cannot be
 
 
 S = State()
@@ -474,6 +476,38 @@ def rule_key(tool, args, decision):
 
 # --- Hooks ----------------------------------------------------------------------------------------------------------
 
+def hermes_attachments(text, bare=False):
+    """The files Hermes itself would attach to a message, and the text it leaves: its MEDIA: reader, plus the bare
+    local paths Weixin also sends (bare). Read from Hermes's gateway code, the same that sends them."""
+    from gateway.platforms.base import BasePlatformAdapter as adapter
+    media, cleaned = adapter.extract_media(text)
+    paths = [p for p, _ in media]
+    if bare:
+        try:
+            paths += adapter.extract_local_files(cleaned)[0]
+        except Exception:
+            pass
+    return paths, cleaned
+
+
+def _attachments_reader(pol):
+    """Hermes's attachment reader, imported once per process; None (and one warning) when it cannot be loaded."""
+    if S.reader is not None:
+        return S.reader or None
+    try:
+        from gateway.platforms.base import BasePlatformAdapter  # noqa: F401
+        S.reader = hermes_attachments
+        return S.reader
+    except Exception as e:
+        S.reader = False
+        if not S.warned_reader:
+            S.warned_reader = True
+            logger.warning("airlock: Hermes's attachment reader cannot be loaded (%s); airlock's own reader alone "
+                           "checks MEDIA: attachments", e)
+            journal(pol, {"type": "warning", "reason": f"Hermes's attachment reader unavailable: {type(e).__name__}"})
+        return None
+
+
 def _context(pol, kwargs, tool):
     session = session_key(kwargs)
     home = _hermes_home()
@@ -488,7 +522,8 @@ def _context(pol, kwargs, tool):
                          destinations=set(e.get("dest") or ()), locked=e.get("locked"),
                          canary=canary() if pol.canary else None,
                          origin=origin(tool) if tool else None, owners=_owners(pol),
-                         written=set(S.written.get(session, ())), stopped=_stopped())
+                         written=set(S.written.get(session, ())), stopped=_stopped(),
+                         attachments=_attachments_reader(pol) if tool in rules.ATTACHING_TOOLS else None)
 
 
 def approvals_bypassed():
@@ -586,6 +621,13 @@ def post_tool_call(tool_name="", args=None, result=None, **kwargs):
             with _lock:
                 S.written.setdefault(session, set()).update(
                     rules.shell.normalize(p, ctx.cwd) for p in paths if p)
+        elif tool_name in rules.COMMAND_TOOLS and tool_name != "execute_code":
+            text = rules.command_text(tool_name, args)
+            cwd = rules.shell.normalize(args["workdir"], ctx.cwd) if args.get("workdir") else ctx.cwd
+            written = rules.shell_written(text, rules.leading_cd(text, cwd)) if text else []
+            if written:
+                with _lock:
+                    S.written.setdefault(session, set()).update(written)
     except Exception:
         logger.exception("airlock: post_tool_call failed")
     return None

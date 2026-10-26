@@ -13,6 +13,7 @@ import itertools
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from urllib.parse import unquote, urlparse
 
@@ -72,6 +73,7 @@ class Context:
     stopped: bool = False                   # the kill switch is on
     canary: str | None = None               # the marker airlock puts in the agent's context; never in a tool call
     destinations: set = field(default_factory=set)  # hosts and addresses named by the untrusted content read
+    attachments: object = None              # Hermes's own reading of a message's attachments (text -> paths), if loaded
     locked: str | None = None               # why this session is locked (canary seen, repeated refused attempts)
 
 
@@ -270,6 +272,291 @@ def tool_urls(tool, args):
     return urls
 
 
+# Tools that turn a MEDIA:<path> in their text into an attachment (Hermes's extract_media), and the argument that
+# lists more attachments.
+ATTACHING_TOOLS = {"send_message", "yb_send_dm"}
+MEDIA_TAG = re.compile(r"MEDIA:", re.I)
+# Where Hermes may end an unquoted path: blanks, markup, punctuation, CJK and fullwidth forms (MEDIA_TAG_CLEANUP_RE).
+HERMES_END = re.compile(r"[\s`\"'*_,;:)\]}\[\u3000-\u303f\uff00-\uffef]")
+# Every place a path could end, wider still: a dot, "<" (a model's end token) or another MEDIA: right after it.
+MEDIA_END = re.compile(r"[\s`\"'*_,;:.<)\]}\[\u3000-\u303f\uff00-\uffef]|MEDIA:", re.I)
+SIMPLEX_MEDIA = re.compile(r"MEDIA:(\S+)")    # SimpleX reads the cleaned text again, raw (adapter.send)
+# A tag as Hermes deletes it from the text it sends (path, then up to three marks and a dot): used to rebuild that
+# text when Hermes's own reader is not available.
+MEDIA_DELETED = re.compile(r"[`\"'*_]{0,3}MEDIA:\s*(\"[^\"\n]+\"|'[^'\n]+'|`[^`\n]+`|[~/][^\s`\"'*_,;:)\]}\[]*)"
+                           r"[`\"'*_]{0,3}\.?", re.I)
+MEDIA_MAX_ENDS = 300            # an unquoted path with more possible ends than this is not read: the call is refused
+MEDIA_MAX_CANDIDATES = 5_000    # same for a message whose tags give more candidate paths than this (a decision is fast)
+MEDIA_MAX_PATH = 4096           # longest path a system opens: nothing past it is read after a tag
+MEDIA_PASSES = 3                # removing a tag can glue the text around it into a new tag: read the result again
+ATTACHMENT_READ = 200_000       # bytes of each attached file checked for secrets and the context marker
+ATTACHMENT_FILES = 20
+_attached_cache = {}
+
+
+def media_candidates(text):
+    """(path, sure) for every file a message could attach, and whether a path was too long to read. Read wider than
+    Hermes reads it: after each MEDIA: (and its blanks, line breaks included) to the end of that line, examples in
+    code or quotes included. An unquoted path may hold spaces or stop at any punctuation (MEDIA:~/My Files/a.pdf,
+    MEDIA:~/p/.env;x): every prefix that ends where a path could end is a candidate. The one that ends where Hermes
+    ends it is sure; another counts when that file exists, as Hermes sends only existing files. Unquoted, only
+    absolute and ~ paths count, as for Hermes; SimpleX's raw reading (MEDIA: then anything up to a blank) is added."""
+    text = text or ""
+    out, overflow = [(p, True) for p in SIMPLEX_MEDIA.findall(text)], False
+    for m in MEDIA_TAG.finditer(text):
+        if len(out) > MEDIA_MAX_CANDIDATES:
+            overflow = True
+            break
+        seg = text[m.end():m.end() + MEDIA_MAX_PATH + 64].lstrip()
+        seg = seg.split("\n", 1)[0].rstrip("\r")[:MEDIA_MAX_PATH]
+        if not seg:
+            continue
+        close = seg.find(seg[0], 1) if seg[0] in "\"'`" else -1
+        if close > 0:
+            quoted = seg[1:close].strip()
+            out += [(quoted, True), (quoted.rstrip(",.;:)}]"), True)]     # as Hermes's _normalize_media_tag_path
+            continue
+        seg = seg.lstrip("\"'`*_")
+        if not seg.startswith(("~", "/")):
+            continue
+        ends = []
+        for x in MEDIA_END.finditer(seg):
+            if x.start():
+                ends.append(x.start())
+            if len(ends) > MEDIA_MAX_ENDS:
+                overflow = True
+                break
+        first = HERMES_END.search(seg, 1)
+        sure = first.start() if first else len(seg)
+        for end in dict.fromkeys(ends[:MEDIA_MAX_ENDS] + [sure, len(seg)]):
+            out.append((seg[:end].rstrip(), end == sure))
+    return [c for c in dict.fromkeys(out) if c[0]], overflow
+
+
+def attachment_path(path, cwd):
+    """A path as Hermes opens it: ~ expanded, never variables ($HOME stays a directory name), links resolved."""
+    return os.path.realpath(os.path.join(cwd or "/", os.path.expanduser(str(path).strip())))
+
+
+def attached(args, ctx):
+    """The files the call would attach (normalized), whether a path was too long to read, and whether Hermes's own
+    reader was used. airlock's reading is joined with Hermes's when the plugin could load it (ctx.attachments), on
+    the message and on the text Hermes leaves once its tags are removed, read again until it stops changing."""
+    message = str(args.get("message") or "")
+    key = (id(args), message, repr(args.get("media_files")), str(args.get("target")), ctx.cwd)
+    if key in _attached_cache:
+        return _attached_cache[key]
+    texts, cands = [message], []
+    for item in args.get("media_files") or []:                   # yb_send_dm: {"path": ...} or (path, is_voice)
+        p = item.get("path") if isinstance(item, dict) else \
+            item[0] if isinstance(item, (list, tuple)) and item else None
+        if isinstance(p, str):
+            cands.append((p, True))
+    hermes = bool(ctx.attachments and message)
+    bare = str(args.get("target") or "").lower().split(":", 1)[0] == "weixin"   # Weixin also sends bare paths
+    if hermes:
+        current = message
+        for _ in range(MEDIA_PASSES):
+            try:
+                paths, cleaned = ctx.attachments(current, bare)
+            except Exception:                                    # Hermes's reader failing leaves airlock's own
+                hermes = False
+                break
+            cands += [(p, True) for p in paths]
+            if cleaned == current:
+                break
+            texts.append(cleaned)
+            current = cleaned
+    if not hermes:
+        current = message
+        for _ in range(MEDIA_PASSES):
+            cleaned = MEDIA_DELETED.sub("", current)
+            if cleaned == current:
+                break
+            texts.append(cleaned)
+            current = cleaned
+    overflow = False
+    for text in texts:
+        found, over = media_candidates(text)
+        cands += found
+        overflow = overflow or over
+    out = []
+    for p, sure in dict.fromkeys(cands):
+        try:
+            joined = os.path.join(ctx.cwd or "/", os.path.expanduser(str(p).strip()))
+            if sure or os.path.lexists(joined):                  # the cheap test first: most candidates are not files
+                out.append(os.path.realpath(joined))
+        except ValueError:                                       # a NUL byte: no file can be opened by that name
+            continue
+    _attached_cache[key] = result = (list(dict.fromkeys(out)), overflow, hermes)
+    return result
+
+
+def attachment_texts(pol, tool, args, ctx):
+    """The start of each attached file's text, so a secret or the context marker in an attachment is seen as in the
+    message itself: the first ATTACHMENT_READ bytes of each regular file, as UTF-8 text (a PDF, an archive or UTF-16
+    text is not decoded), and None when more than ATTACHMENT_FILES regular files are attached (not all are read).
+    Files behind a wall stay unread (the wall refuses them first)."""
+    if tool not in ATTACHING_TOOLS:
+        return []
+    out = []
+    for path in attached(args, ctx)[0]:
+        if access_wall(path, pol, ctx):
+            continue
+        try:                                                     # non-blocking: a FIFO swapped in must not hang
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        except OSError:
+            continue
+        try:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                if len(out) >= ATTACHMENT_FILES:
+                    return None
+                out.append(os.read(fd, ATTACHMENT_READ).decode("utf-8", "ignore"))
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return out
+
+
+# Cloud instance metadata services hand the machine's credentials to whoever asks from inside it: no agent needs
+# them, and an injected one reading them is the first step of taking over the server. A command that names the
+# address is refused unless every program that names it only reads or files text (grep, a firewall rule, a commit);
+# other tools are refused when a URL host or an address argument is the service.
+METADATA_IPS = {ipaddress.ip_address(a) for a in ("169.254.169.254", "169.254.170.2", "169.254.170.23",
+                                                  "100.100.100.200", "fd00:ec2::254", "fd00:ec2::23", "fd20:ce::254")}
+METADATA_DOTTED = {"metadata.google.internal", "metadata.goog", "metadata.azure.com", "instance-data.ec2.internal",
+                   "metadata.tencentyun.com"}
+METADATA_SHORT = {"metadata", "instance-data"}                # names only as the host of a URL
+METADATA_TEXT = re.compile(r"(?<![\d.])(169[.-]254[.-]169[.-]254|169[.-]254[.-]170[.-]23?|100[.-]100[.-]100[.-]200)"
+                           r"(?!\d)|fd00:ec2::(254|23)\b|fd20:ce::254\b|metadata\.google\.internal|metadata\.goog\b|"
+                           r"metadata\.azure\.com|instance-data\.ec2\.internal|metadata\.tencentyun\.com", re.I)
+METADATA_VARS = re.compile(r"\b(ECS_CONTAINER_METADATA_URI(_V4)?|AWS_CONTAINER_CREDENTIALS_(FULL|RELATIVE)_URI|"
+                           r"AWS_CONTAINER_AUTHORIZATION_TOKEN(_FILE)?)\b")
+URL_ANY_HOST = re.compile(r"\b[a-z][\w+.-]*://(?:[^@/\s\"'<>]*@)?(\[[^\]\s]+\]|[^/\s:?#\"'<>]+)", re.I)
+# Programs that only read, print or file text: naming the address there reaches nothing. A command names it freely
+# only when every program of the whole line is one of these (a pipe to curl is not), with no substitution.
+METADATA_SAFE_VERBS = {"grep", "egrep", "fgrep", "rg", "echo", "printf", "cat", "head", "tail", "wc", "sort", "uniq",
+                       "diff", "cut", "tr", "jq", "yq", "tee", "iptables", "ip6tables", "nft", "ufw", "pfctl",
+                       "firewall-cmd", "git", "cd", "pushd", "popd", "true"}
+# Options or settings that make a "safe" program run another one, or a redirection that opens a network socket.
+METADATA_UNSAFE = re.compile(r"/dev/(tcp|udp)/|--ext-diff|--compress-program|--diff-program|--use-compress-program|"
+                             r"--pager|--open-files-in-pager|--exec-path|--pre\b|(?:^|\s)-O|"
+                             r"\bcore\.(pager|fsmonitor|sshcommand|editor|hookspath)\b|\balias\.", re.I)
+GIT_SAFE = {"commit", "log", "diff", "show", "grep", "add", "status", "blame", "shortlog"}
+GIT_GLOBAL_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+SUBSTITUTION = re.compile(r"`|\$\(|[<>]\(")
+# Tools that carry text, stored, searched or handed to someone: naming the address there reaches nothing.
+NOT_REACHING = {"memory", "todo", "todo_list", "web_search", "x_search", "skill_manage", "session_search",
+                "delegate_task", "clarify", "cronjob", "cronjob_manage", "send_message", "yb_send_dm", "discord"}
+
+
+def _git_subcommand(words):
+    """The subcommand of a git command line, global options skipped (git -C dir fetch, git -c k=v clone)."""
+    w = list(words[1:])
+    while w and w[0].startswith("-"):
+        opt = w.pop(0)
+        if opt in GIT_GLOBAL_VALUE and w:
+            w.pop(0)
+    return w[0] if w else ""
+
+
+def _only_names(text):
+    """True when every program of a command line only reads, prints or files text, so the metadata address it
+    names reaches nothing: no substitution, no program outside METADATA_SAFE_VERBS anywhere in the line, git limited
+    to local subcommands."""
+    if SUBSTITUTION.search(text) or METADATA_UNSAFE.search(text):
+        return False
+    for view in dict.fromkeys([text] + shell.command_views(text)):
+        for seg in shell.segments(view):
+            w, raw = shell.command_words(seg), shell.words(seg)
+            if w is None or raw is None:
+                return False
+            if not w:
+                continue
+            name = os.path.basename(w[0])
+            if name not in METADATA_SAFE_VERBS or (name == "git" and (_git_subcommand(w) not in GIT_SAFE or
+                                                                      "-c" in w or "--config-env" in w)):
+                return False
+            if re.match(r"^\w+=", (shell.tokens(seg) or [""])[0]):     # VAR=... before a program can change it
+                return False
+    return True
+
+
+def _inet_aton(host):
+    """An IPv4 address in the forms the C resolver accepts (2852039166, 0xa9fea9fe, 0251.0376.0251.0376, 169.16689662),
+    without the socket module: a guard that reads text has no network import."""
+    parts = host.split(".")
+    if not 1 <= len(parts) <= 4 or not all(re.fullmatch(r"0x[0-9a-f]+|0[0-7]*|[1-9][0-9]*", p) for p in parts):
+        return None
+    nums = [int(p, 16) if p.startswith("0x") else int(p, 8) if len(p) > 1 and p.startswith("0") else int(p)
+            for p in parts]
+    *head, last = nums
+    if any(n > 255 for n in head) or last >= 256 ** (4 - len(head)):
+        return None
+    value = last
+    for i, n in enumerate(head):
+        value += n << (8 * (3 - i))
+    return ipaddress.ip_address(value)
+
+
+def _metadata_address(token):
+    host = token.strip("[]").lower().rstrip(".")
+    if host in METADATA_DOTTED:
+        return True
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        ip = _inet_aton(host)
+    if ip is not None and getattr(ip, "ipv4_mapped", None):
+        ip = ip.ipv4_mapped
+    return ip in METADATA_IPS
+
+
+def _braces(text, limit=20):
+    """Texts with the shell's brace lists expanded (169.254.169.25{4,5}), a few at most."""
+    out, todo = [], [text]
+    while todo and len(out) < limit:
+        t = todo.pop()
+        m = re.search(r"\{([^{}\s]*,[^{}\s]*)\}", t)
+        if not m:
+            out.append(t)
+            continue
+        todo += [t[:m.start()] + part + t[m.end():] for part in m.group(1).split(",")][:limit]
+    return out
+
+
+def names_metadata(text):
+    """True when a text names a metadata service: an address in any form a parser accepts, a dotted host, or a short
+    name (metadata, instance-data) as the host of a URL. The bare word "metadata" is not an address."""
+    for w in _braces(text) if "{" in text else [text]:
+        if METADATA_TEXT.search(w):
+            return True
+        if any(h.strip("[]").lower().rstrip(".") in METADATA_SHORT or _metadata_address(h)
+               for h in URL_ANY_HOST.findall(w)):
+            return True
+        for token in re.split(r"[\s\"'`<>()\[\]{},;|&=@/\\]+", w):
+            host, _, port = token.rpartition(":")
+            if _metadata_address(token) or (port.isdigit() and host and _metadata_address(host)):
+                return True
+    return False
+
+
+def metadata_target(tool, args, texts):
+    """True when the call can reach a cloud metadata service: a command that names it with a program that could reach
+    the network, code that names it, or another tool whose URL host or address is the service. Writing a file that
+    names it reaches nothing (running that file later is another call)."""
+    if tool in NOT_REACHING or tool in FILE_WRITE_TOOLS:
+        return False
+    if tool in COMMAND_TOOLS or tool == "process_manage":
+        text = command_text(tool, args)
+        views = list(dict.fromkeys(guards.views([text]) + shell.command_views(text)))
+        if not any(names_metadata(v) or METADATA_VARS.search(v) for v in views):
+            return False
+        return tool == "execute_code" or not _only_names(text)
+    return any(names_metadata(v) for v in guards.views(texts))
+
+
 # --- Walls ------------------------------------------------------------------------------------------------------
 
 def walls(pol, tool, args, ctx):
@@ -279,6 +566,11 @@ def walls(pol, tool, args, ctx):
         for rx in pol.words:
             if rx.search(t):
                 return Decision("block", "wall", f"forbidden word ({rx.pattern})", "walls.words", True)
+    # A message, a note or a file may mention the address; a command, code, a page or a third-party tool that names
+    # it may not run.
+    if pol.cloud_metadata and tool not in FILE_READ_TOOLS and metadata_target(tool, args, list(_texts(args))):
+        return Decision("block", "wall", "reaches the cloud metadata service, which hands out this server's "
+                                         "credentials", "walls.cloud_metadata", True)
     cwd = ctx.cwd
     if tool in FILE_READ_TOOLS or tool in FILE_WRITE_TOOLS:
         paths = [args.get("path"), args.get("file_path"), args.get("dir"), args.get("directory")]
@@ -307,6 +599,12 @@ def walls(pol, tool, args, ctx):
         if args.get("workdir"):
             cwd = shell.normalize(args["workdir"], cwd)
         return command_walls(pol, text, ctx, leading_cd(text, cwd), code=tool == "execute_code")
+    if tool in ATTACHING_TOOLS:
+        for p in attached(args, ctx)[0]:
+            r = access_wall(p, pol, ctx)
+            if r:
+                return Decision("block", "wall", f"attaches a file the agent may not read: {r}", "walls.paths", True)
+        return None
     if tool.startswith("browser_"):
         for t in _texts(args):
             for u in re.findall(r"file:[^\s\"'`<>)\]]+", t, re.I):
@@ -317,6 +615,146 @@ def walls(pol, tool, args, ctx):
                 if r:
                     return Decision("block", "wall", r, "walls.paths", True)
     return None
+
+
+# Programs that run a file given after a subcommand (uv run x.py), after -f (awk -f x.awk), or as their first
+# argument (tsx x.ts); interpreters (sh, python3, node...) are read by shell.is_interpreter.
+SUBCOMMAND_RUNNERS = {"uv", "poetry", "pipenv", "bun", "deno", "go", "npm", "pnpm", "yarn", "hatch", "pdm"}
+FILE_OPTION_RUNNERS = {"awk", "gawk", "mawk", "nawk", "make", "gmake", "sed"}
+FILE_RUNNERS = {"tsx", "ts-node", "npx", "bunx", "uvx", "pipx", "busybox"}
+
+
+def _ran_files(words):
+    """The files a simple command runs: the program itself, the script an interpreter or a runner is given (sh x.sh,
+    python3 x.py, uv run x.py, awk -f x.awk, tsx x.ts), not the arguments of other programs (git add x runs
+    nothing)."""
+    if not words:
+        return []
+    name, rest = os.path.basename(words[0]), list(words[1:])
+    out = [words[0]]
+    if name in FILE_OPTION_RUNNERS:
+        out += [rest[i + 1] for i, a in enumerate(rest[:-1]) if a == "-f"]
+        out += [a[2:] for a in rest if a.startswith("-f") and len(a) > 2]
+        return out
+    if name in SUBCOMMAND_RUNNERS and rest[:1] in (["run"], ["exec"], ["x"]):
+        rest = rest[1:]
+    elif not (shell.is_interpreter(name) or name in FILE_RUNNERS):
+        return out
+    args = [a for a in rest if not a.startswith("-")]
+    if name == "busybox" and args:
+        return out + _ran_files(args)
+    return out + args[:1]
+
+
+GIT_READ_ONLY = {"--get", "--get-all", "--get-regexp", "--unset", "--unset-all", "--list", "-l", "--remove-section",
+                 "--show-origin", "--name-only"}
+SHELL_REDIRECTION = re.compile(r"(?:\d+|&)?(?<![<>])>>?\|?[ \t]*([^\s;&|<>()`]+)")
+
+
+def git_alias(text):
+    """Why a command line defines or runs a git alias (a command run later, or now, under another name), or None:
+    git config alias.x ... (not a read or an unset), git -c alias.x=... <subcommand>."""
+    for seg in shell.segments(text):
+        w = shell.command_words(seg) or []
+        if not w or os.path.basename(w[0]) != "git":
+            continue
+        if any(a == "-c" and b.lower().startswith("alias.") for a, b in zip(w, w[1:])):
+            return "runs a git alias defined on the command line"
+        sub_args = w[w.index("config") + 1:] if "config" in w else []
+        if _git_subcommand(w) == "config" and any(a.lower().startswith("alias.") for a in w) and \
+                not any(a in GIT_READ_ONLY for a in w) and sub_args[:1] not in (["get"], ["list"]):
+            return "defines a git alias, a command that runs later under another name"
+    return None
+
+
+def _downloads(words):
+    """Files a curl or wget command line saves."""
+    name, w = os.path.basename(words[0]), list(words[1:])
+    remote = [os.path.basename(urlparse(u).path.rstrip("/")) or "index.html"
+              for u in w if re.match(r"(?i)^(https?|ftp)://", u)]
+    out, folder, named = [], "", False
+    for i, a in enumerate(w):
+        nxt = w[i + 1] if i + 1 < len(w) else ""
+        if name == "curl":
+            if a in ("-o", "--output") or re.fullmatch(r"-[a-zA-Z]*o", a):
+                out.append(nxt)
+            elif a.startswith("--output="):
+                out.append(a.split("=", 1)[1])
+            elif re.fullmatch(r"-o.+", a):
+                out.append(a[2:])
+            elif a in ("-O", "--remote-name", "--remote-name-all") or re.fullmatch(r"-[a-zA-Z]*O[a-zA-Z]*", a):
+                named = True
+            elif a == "--output-dir":
+                folder = nxt
+            elif a.startswith("--output-dir="):
+                folder = a.split("=", 1)[1]
+        else:
+            if a in ("-O", "--output-document"):
+                out.append(nxt)
+            elif a.startswith("--output-document="):
+                out.append(a.split("=", 1)[1])
+            elif re.fullmatch(r"-O.+", a):
+                out.append(a[2:])
+            elif a in ("-P", "--directory-prefix"):
+                folder = nxt
+            elif a.startswith("--directory-prefix="):
+                folder = a.split("=", 1)[1]
+    if name == "wget" and out:
+        folder = ""                                   # wget ignores -P when -O names the file
+    if name == "wget" and not out:
+        named = True
+    if named:
+        out += remote
+    return [os.path.join(folder, f) if folder else f for f in out if f and f != "-"]
+
+
+def _word_at(text, start):
+    """The shell word that starts at `start`, quotes removed (> "run.sh" writes run.sh)."""
+    out, quote = [], None
+    for c in text[start:]:
+        if quote:
+            if c == quote:
+                quote = None
+            else:
+                out.append(c)
+        elif c in "'\"":
+            quote = c
+        elif c.isspace() or c in ";&|<>()`":
+            break
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def shell_written(text, cwd, depth=0):
+    """Files a command line writes through the shell, so that running one later counts as running a file this
+    conversation wrote: redirections (> f, >> f, 1> f, &> f), tee, a download's output (curl -o f, curl -O,
+    wget), and the same inside substitutions, sh -c strings, eval and heredocs read by a shell."""
+    if depth > 3 or not text:
+        return []
+    p, out = shell.parse(text), []
+    for seg in p.segments:
+        targets = [_word_at(seg, m.start(1)) for m in SHELL_REDIRECTION.finditer(shell.unquoted(seg))]
+        w = shell.command_words(seg) or []
+        name = os.path.basename(w[0]) if w else ""
+        if name == "tee":
+            targets += [a for a in w[1:] if not a.startswith("-")]
+        if name in ("curl", "wget"):
+            targets += _downloads(w)
+        if name == "eval":
+            out += shell_written(" ".join(w[1:]), cwd, depth + 1)
+        elif name in shell.REEVALUATING_SHELLS:
+            for j, a in enumerate(w[1:-1], 1):
+                if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", a):
+                    out += shell_written(w[j + 1], cwd, depth + 1)
+                    break
+        out += [shell.normalize(f, cwd) for f in targets if f and not f.startswith(("/dev/", "&"))]
+    for body in shell.substitution_bodies(text):
+        out += shell_written(body, cwd, depth + 1)
+    for k, quoted, body in p.heredocs:
+        if k < len(p.segments) and shell.verb(p.segments[k]) in shell.REEVALUATING_SHELLS:
+            out += shell_written(body, cwd, depth + 1)
+    return list(dict.fromkeys(out))
 
 
 def command_text(tool, args):
@@ -439,13 +877,17 @@ def categories(pol, tool, args, ctx):
                 if rx.search(content) or rx.search(shell.unmask(content)):
                     found.append((cat, f"a script that {_describe(rid, rx, content, cat)}", f"egress.{rid}"))
                     break
-    if text and ctx.tainted and ctx.written and tool != "execute_code":
+    if text and ctx.tainted and tool != "execute_code":
         cwd = leading_cd(text, shell.normalize(args["workdir"], ctx.cwd) if args.get("workdir") else ctx.cwd)
-        ran = [a for seg in shell.segments(text) for a in (shell.command_words(seg) or [])[:3]]
-        hit = next((a for a in ran if shell.normalize(a, cwd) in ctx.written), None)
+        written = ctx.written | set(shell_written(text, cwd))     # written earlier, or earlier in this same line
+        ran = [a for seg in shell.segments(text) for a in _ran_files(shell.command_words(seg) or [])]
+        hit = next((a for a in ran if shell.normalize(a, cwd) in written), None) if written else None
         if hit:
             found.append(("written_script", f"runs {hit}, a file written in this session after reading untrusted "
                                             "content", "written_then_run"))
+    alias = git_alias(text) if text else None
+    if alias:
+        found.append(("persistence", alias, "git_alias"))
     for u in tool_urls(tool, args):
         if exfil_url(u, pol):
             found.append(("exfil_url", f"URL that could carry data out ({u[:60]})", "exfil_url"))
@@ -599,6 +1041,7 @@ def decide(pol, tool, args, ctx):
     args = args if isinstance(args, dict) else {}
     shell.new_decision()
     guards.new_decision()
+    _attached_cache.clear()
     texts = list(_texts(args))
     size = sum(len(t) for t in texts)
     if size > MAX_CHECKED and tool not in FILE_READ_TOOLS and tool not in FILE_WRITE_TOOLS:
@@ -608,7 +1051,14 @@ def decide(pol, tool, args, ctx):
         return Decision("block", "canary", "this call carries airlock's private session marker: the agent is copying "
                                            "its own context out, which only an injected instruction asks for",
                         "canary", True)
+    attach = _attachments(pol, tool, args, ctx)
+    if attach and attach.category == "canary":
+        return attach
     d = _decide(pol, tool, args, ctx, texts)
+    if attach and ctx.stopped:
+        attach = Decision("block", attach.category, f"{attach.reason}; the airlock stop switch is on", attach.rule)
+    if attach and (d is None or ORDER[attach.level] >= ORDER[d.level]):
+        d = attach
     if ctx.locked and (d is None or d.level != "block"):
         reaches_out = d is not None or tool in SEARCH_TOOLS or tool in PROVIDER_TOOLS or _third_party(ctx) or any(
             not _loopback(u) and not _domain_trusted(u, pol) for u in tool_urls(tool, args))
@@ -616,6 +1066,35 @@ def decide(pol, tool, args, ctx):
             return Decision("block", d.category if d else "locked", f"this conversation is locked ({ctx.locked}); "
                             "the owner must review it before anything leaves", "locked")
     return d
+
+
+def secret_decision(hit, pol, where=""):
+    """The decision for a recognized secret leaving: block for a strong format under secrets_out: block, else ask."""
+    name, strong = hit
+    level = "block" if strong and pol.secrets_out == "block" else "approve"
+    article = "an" if name[0] in "AEIOUx" or name.startswith("npm") else "a"      # an AWS, an xAI, an npm
+    return Decision(level, "secret", f"{where}{article} {name} would leave the machine in clear; secrets go through "
+                                     "an environment variable or the tool's own login, never in a call",
+                    "secret", level == "block")
+
+
+def _attachments(pol, tool, args, ctx):
+    """The context marker or a recognized secret inside an attached file, judged as if it were in the message. Each
+    file is read on its own (a big first file does not hide the next one)."""
+    texts = attachment_texts(pol, tool, args, ctx)
+    if texts is None:
+        return Decision("approve", "message", f"more than {ATTACHMENT_FILES} files attached: their content is not all "
+                                              "checked for secrets", "attachments")
+    if ctx.canary and texts and guards.carries_canary(texts, ctx.canary):
+        return Decision("block", "canary", "an attached file carries airlock's private session marker: the agent "
+                                           "is sending its own context out", "canary", True)
+    hit = guards.find_secret(texts) if texts else None              # a strong format in any file before a weak one
+    if hit:
+        return secret_decision(hit, pol, "an attached file holds a secret: ")
+    if attached(args, ctx)[1]:
+        return Decision("approve", "message", "attachment paths too long or too many to check: put each MEDIA: path "
+                                              "on its own line", "attachments")
+    return None
 
 
 def _third_party(ctx):
@@ -703,12 +1182,7 @@ def _decide(pol, tool, args, ctx, texts):
     if outbound and not _local_only(tool, args, texts, found, pol):
         hit = guards.find_secret(texts)
         if hit:
-            name, strong = hit
-            level = "block" if strong and pol.secrets_out == "block" else "approve"
-            article = "an" if name[0] in "AEIOUx" or name.startswith("npm") else "a"      # an AWS, an xAI, an npm
-            secret = Decision(level, "secret", f"{article} {name} would leave the machine in clear; secrets go through "
-                                               "an environment variable or the tool's own login, never in a call",
-                              "secret", level == "block")
+            secret = secret_decision(hit, pol)
     if ctx.tainted and ctx.destinations and pol.destinations != "off":
         named = guards.named_destination(_address_texts(pol, tool, args, texts), ctx.destinations,
                                          ignore=lambda h: _local_host(h, pol))

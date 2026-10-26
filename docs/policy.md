@@ -60,6 +60,7 @@ auto-approve it like its own prompts.
 | `secret_files` | Regular expressions on full paths: files that hold secrets wherever they are |
 | `secret_files_except` | Paths that match `secret_files` but are not secrets (`.env.example`, design tokens) |
 | `isolate_profiles` | `true` (default): another Hermes profile's directory is out of reach |
+| `cloud_metadata` | `true` (default): a command, code, a page load or a third-party tool that names a cloud metadata service (`169.254.169.254`, `metadata.google.internal`...) in the call itself is refused: the service hands out the server's credentials. Free: messages, memory, web searches, session searches, delegated goals, scheduled prompts, files being written, and command lines whose every program only reads or files text (`grep`, `nft`, `iptables`, local `git` subcommands, `cd`), with no substitution and no option that runs another program (a pager, a preprocessor, an external diff). By name only: see the threat model for what it cannot see |
 | `words` | Case-insensitive regular expressions that must never appear in any tool call (a command, a file being written, a message) |
 | `commands` | `{id, pattern, reason}`: commands refused outright (switching the guard or approvals off, changing `HERMES_HOME`) |
 | `destructive` | Patterns of catastrophic deletions |
@@ -67,8 +68,8 @@ auto-approve it like its own prompts.
 Your file can add walls but not remove the default ones: lists are appended, and `disable` only reaches
 `walls.commands` and `egress` ids. To narrow a default wall, edit your copy of the plugin, knowingly.
 
-Paths are checked after resolving `~`, variables, symlinks and `..`, in the arguments of file tools, in commands and
-code (including paths built in pieces: `os.path.join('~', '.ss' + 'h')`, `Path.home() / '.aws'`), and through
+Paths are checked after resolving `~`, variables, symlinks and `..`, in the arguments of file tools, in message attachments
+(`MEDIA:<path>`), in commands and code (including paths built in pieces: `os.path.join('~', '.ss' + 'h')`, `Path.home() / '.aws'`), and through
 wildcards (`~/.ss*/id_*`).
 
 ## `egress`

@@ -994,6 +994,58 @@ def argv_literals(code: str) -> list:
     return out
 
 
+def substitution_bodies(text: str) -> list:
+    """The commands inside `...` and inside a double-quoted "$(...)" that the shell runs. Read segment by segment
+    (comments and heredoc bodies are already out, so a stray apostrophe there opens no quote); an unquoted $(...) is
+    not returned, parse already splits it into segments."""
+    out = []
+    for seg in parse(text or "").segments:
+        i, n, quote = 0, len(seg), None
+        while i < n:
+            c = seg[i]
+            if quote == "'":
+                quote = None if c == "'" else quote
+            elif c == "\\":
+                i += 2
+                continue
+            elif c == "'" and quote is None:
+                quote = "'"
+            elif c == '"':
+                quote = None if quote == '"' else '"'
+            elif c == "`":
+                end = seg.find("`", i + 1)
+                while end > 0 and seg[end - 1] == "\\":
+                    end = seg.find("`", end + 1)
+                out.append(seg[i + 1:] if end < 0 else seg[i + 1:end].replace("\\`", "`"))
+                if end < 0:
+                    break
+                i = end + 1
+                continue
+            elif c == "$" and quote == '"' and seg[i + 1:i + 2] == "(" and seg[i + 2:i + 3] != "(":
+                depth, j = 1, i + 2
+                while j < n and depth:
+                    depth += {"(": 1, ")": -1}.get(seg[j], 0)
+                    j += 1
+                out.append(seg[i + 2:j - 1] if not depth else seg[i + 2:])
+                i = j
+                continue
+            i += 1
+    return [b for b in out if b.strip()]
+
+
+def unquoted(segment: str) -> str:
+    """A segment with the inside of its quotes blanked (same length): what the shell reads as operators, not text."""
+    out, quote = [], None
+    for c in segment:
+        if quote:
+            out.append(c if c == quote else " ")
+            quote = None if c == quote else quote
+        else:
+            quote = c if c in "'\"" else None
+            out.append(c)
+    return "".join(out)
+
+
 def command_views(text: str, depth: int = 0, code: bool = True) -> list:
     """What a command line actually runs, one line per simple command: its words, with any word that holds a space
     replaced by "…" (a text value such as a commit message, not a subcommand). Shell strings run by sh -c, eval,
@@ -1003,6 +1055,8 @@ def command_views(text: str, depth: int = 0, code: bool = True) -> list:
         return []
     p = parse(text or "")
     out = []
+    for body in substitution_bodies(text or "") if p.substitution else []:
+        out += command_views(body, depth + 1, code)
     for k, seg in enumerate(p.segments):
         if not seg:
             continue

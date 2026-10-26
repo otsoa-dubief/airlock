@@ -557,11 +557,14 @@ def test_attachments_read_from_the_disk(plugin, tmp_path):
     r = call(plugin, "send_message", {"action": "send", "target": "telegram:987654321",
                                       "message": f"ci-joint MEDIA:{spaced}/server.pem pour info"})
     assert r["action"] == "block"                       # spaces, two of them, no quotes: the existing file is found
-    ssh = tmp_path / "c  d"
-    ssh.symlink_to(os.path.expanduser("~"))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "id_ed25519").write_text("k")
+    link = tmp_path / "c  d"
+    link.symlink_to(vault)
     r = call(plugin, "send_message", {"action": "send", "target": "telegram:987654321",
-                                      "message": f"MEDIA:{ssh}/.ssh/id_ed25519"})
-    assert r["action"] == "block"                       # a link to home with two spaces in its name
+                                      "message": f"MEDIA:{link}/id_ed25519"})
+    assert r["action"] == "block"                       # through a link with two spaces in its name
     long = tmp_path / " ".join("abcdefghijklmnopqrstuvw")
     long.mkdir()
     (long / "server.key").write_text("x")

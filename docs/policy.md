@@ -47,8 +47,9 @@ they always block.
 
 ## `approvals_off`
 
-`block` (default) or `follow`. When Hermes would approve without asking anyone (`--yolo`, `approvals.mode: off`, a
-cron job with `approvals.cron_mode: approve`), `block` turns every "asks you" into a block; `follow` lets Hermes
+`block` (default) or `follow`. When Hermes would approve without asking anyone (`--yolo`, `/yolo`, `hermes -z`,
+`approvals.mode: off`, a cron job, `-q` run or webhook whose `approvals.*_mode` is `approve`, a subagent under
+`delegation.subagent_auto_approve`), `block` turns every "asks you" into a block; `follow` lets Hermes
 auto-approve it like its own prompts.
 
 ## `walls`

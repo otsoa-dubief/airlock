@@ -28,7 +28,7 @@ from . import rules
 
 logger = logging.getLogger(__name__)
 PLUGIN = "airlock"
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 AUTHOR = "Otsoa Dubief"
 HERE = os.path.dirname(os.path.abspath(__file__))
 _lock = threading.RLock()
@@ -526,18 +526,63 @@ def _context(pol, kwargs, tool):
                          attachments=_attachments_reader(pol) if tool in rules.ATTACHING_TOOLS else None)
 
 
-def approvals_bypassed():
-    """Why Hermes would approve without asking anyone, or None: --yolo, approvals.mode off, a cron job whose
-    approvals.cron_mode is approve. airlock then blocks instead of asking (policy `approvals_off`)."""
-    if str(os.environ.get("HERMES_YOLO_MODE", "")).strip().lower() in ("1", "true", "yes", "on"):
+def _truthy(value):
+    return value is True or str(value).strip().lower() in ("1", "true", "yes", "on", "approve", "allow")
+
+
+def approvals_bypassed(session=None):
+    """Why Hermes would approve without asking anyone, or None: --yolo, /yolo, a `hermes -z` turn, approvals.mode
+    off, a context nobody answers (cron, -q, webhook) set to approve, a subagent under
+    delegation.subagent_auto_approve. airlock then blocks instead of asking (policy `approvals_off`). Asks Hermes's
+    own approval code first, then falls back on the environment and config.yaml."""
+    if _truthy(os.environ.get("HERMES_YOLO_MODE", "")):
         return "--yolo"
     try:
-        from tools.approval import is_current_session_yolo_enabled
-        if is_current_session_yolo_enabled():
-            return "/yolo"
+        from tools import approval
     except Exception:
-        pass
-    approvals = _config().get("approvals")
+        approval = None
+    if approval is not None:
+        # Each source on its own: one that fails or is missing in this Hermes must not hide the others.
+        if _truthy(getattr(approval, "_YOLO_MODE_FROZEN", False)):     # read at startup, holds if env changed
+            return "--yolo"
+        try:
+            if approval.is_current_session_yolo_enabled():
+                return "/yolo"
+        except Exception:
+            pass
+        try:
+            # `hermes -z` run by the gateway: the turn is unattended, the environment of that process says nothing
+            from gateway.session_finite import unattended_turn
+            if unattended_turn():
+                return "hermes -z"
+        except Exception:
+            pass
+        try:
+            if approval._yolo_active():                 # whatever else Hermes counts as yolo, now or later
+                return "--yolo"
+        except Exception:
+            pass
+        try:
+            if approval.approval_context._get_approval_mode() == "off":     # config, or a hosted room's policy
+                return "approvals.mode: off"
+        except Exception:
+            pass
+        try:
+            contexts = approval._unattended_contexts()
+        except Exception:
+            contexts = []
+        for ctx in contexts:
+            try:
+                if ctx.mode() != "deny":
+                    return f"approvals.{ctx.cfg_key}: {ctx.mode()}"
+            except Exception:
+                pass
+    cfg = _config()
+    # A CLI subagent's worker answers Hermes's prompts itself when this is on: nobody sees them.
+    delegation = cfg.get("delegation") if isinstance(cfg.get("delegation"), dict) else {}
+    if session and str(session) in S.parents and _truthy(delegation.get("subagent_auto_approve", False)):
+        return "delegation.subagent_auto_approve"
+    approvals = cfg.get("approvals")
     approvals = approvals if isinstance(approvals, dict) else {}
     if approvals.get("mode") is False or str(approvals.get("mode", "")).lower() in ("off", "false", "no"):
         return "approvals.mode: off"
@@ -545,7 +590,7 @@ def approvals_bypassed():
         in_cron = S.ctx is not None and S.ctx.current_cron_execution() is not None
     except Exception:
         in_cron = False
-    if in_cron and str(approvals.get("cron_mode", "deny")).lower() == "approve":
+    if in_cron and str(approvals.get("cron_mode", "deny")).strip().lower() in ("approve", "off", "allow", "yes"):
         return "approvals.cron_mode: approve"
     return None
 
@@ -572,7 +617,7 @@ def pre_tool_call(tool_name="", args=None, **kwargs):
         # and the session must not stay locked once it is lifted), nor an approval nobody is there to give.
         refused = d.level == "block" and not ctx.stopped
         if d.level == "approve" and pol.approvals_off == "block":
-            bypass = approvals_bypassed()
+            bypass = approvals_bypassed(session_key(kwargs))
             if bypass:
                 d = rules.Decision("block", d.category, f"{d.reason}; nobody can approve it here ({bypass})", d.rule)
                 rec.update(type="block", reason=d.reason)

@@ -47,7 +47,7 @@ policy file: they can switch airlock off.
 | The page names where to send ("post it to collector.example") | After untrusted content, a call to an address the content named is blocked (`destinations`) |
 | The agent tries variant after variant until one passes | Three refused calls in a tainted conversation lock it (`breaker`) |
 | Lookalike letters or invisible characters hide the real command | Text is folded (NFKC), invisible characters removed, lookalike program names refused |
-| Approvals are switched off (`--yolo`, `approvals.mode: off`, cron set to approve) | What would ask you is blocked (`approvals_off: block`) |
+| Approvals are switched off (`--yolo`, `/yolo`, `hermes -z`, `approvals.mode: off`, cron, `-q` or webhook set to approve, `delegation.subagent_auto_approve`) | What would ask you is blocked (`approvals_off: block`) |
 | Data sent by code (`http.client`, `urlopen`, Node `https`, Ruby `Net::HTTP`, `/dev/tcp`) | After untrusted content, any code that reaches a non-local host asks you |
 | airlock itself crashes | The call is blocked |
 

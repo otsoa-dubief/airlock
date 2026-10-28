@@ -33,8 +33,9 @@ actions:
   unadmitted_tool:  {clean: approve, tainted: approve}   # a plugin or MCP tool nobody admitted (see `tools:`)
   bypass:           {clean: block,   tainted: block}     # a command that computes or hides what it runs
 
-# When Hermes would approve without asking anyone (--yolo, approvals.mode: off, a cron job with
-# approvals.cron_mode: approve), what becomes of an action airlock sends for approval: block (default) or follow
+# When Hermes would approve without asking anyone (--yolo, /yolo, hermes -z, approvals.mode: off, a cron job,
+# -q run or webhook set to approve, a subagent under delegation.subagent_auto_approve), what becomes of an action
+# airlock sends for approval: block (default) or follow
 # (let Hermes auto-approve it, as it does for its own prompts).
 approvals_off: block
 

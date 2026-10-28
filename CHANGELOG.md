@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.3 — 2026-10-28
+
+- Security (GHSA-mgf8-gh7g-q4rg): with `approvals_off: block` (the default), an action airlock sends for approval
+  ran without approval in a `hermes -z` turn run by the gateway. Hermes marks such a turn unattended in the turn
+  itself, not in `HERMES_YOLO_MODE`, so airlock did not see that nobody could approve. airlock now asks Hermes's
+  own approval code why it would approve alone: `--yolo` read at startup, `/yolo`, a `hermes -z` turn,
+  `approvals.mode: off` (a hosted room's policy too), and a cron job, `-q` run or webhook whose `approvals.*_mode`
+  is `approve`. The environment and `config.yaml` remain the fallback for older Hermes. Reported by Cleiton
+  Augusto.
+- Same check, found while fixing it: a subagent run from the CLI with `delegation.subagent_auto_approve: true`
+  answers Hermes's prompts itself; what airlock sends for approval in that subagent is now blocked too. The
+  parent session still asks the owner.
+- `approvals.cron_mode` is read as Hermes reads it (`off`, `allow` and `yes` approve too).
+
 ## 0.2.2 — 2026-10-26
 
 - Attachments: `send_message` (and Yuanbao's `yb_send_dm`) turns a `MEDIA:<path>` in its text into an attachment.

@@ -136,9 +136,9 @@ never a family of calls.
 
 Messages to your own home channels are not outbound. Everything in the table is a setting.
 
-When nobody can approve (`--yolo`, `approvals.mode: off`, a cron job with `approvals.cron_mode: approve`), Hermes
-would let "asks you" actions through on its own. airlock blocks them instead; set `approvals_off: follow` in your
-policy to let Hermes decide.
+When nobody can approve (`--yolo`, `/yolo`, `hermes -z`, `approvals.mode: off`, a cron job, `-q` run or webhook set
+to approve, a subagent under `delegation.subagent_auto_approve`), Hermes would let "asks you" actions through on its
+own. airlock blocks them instead; set `approvals_off: follow` in your policy to let Hermes decide.
 
 ## Configure
 

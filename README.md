@@ -196,6 +196,11 @@ airlock is a guard on what the agent asks its tools to do. It is one layer, not 
   [docs/threat-model.md](docs/threat-model.md#what-stays-out-of-reach).
 - **Some memory is per process.** The link between a subagent and its parent, and the list of files a conversation
   wrote, do not survive a restart. Taints do.
+- **On Windows, it reads Git Bash.** Hermes's terminal on Windows is Git Bash, and airlock reads its commands
+  and paths (`/c/...`, `C:\...`, `$USERPROFILE`). It does not read PowerShell or `cmd` syntax: a command run
+  through `powershell -c` or `cmd //c` is only checked for the patterns it is known to use (recursive deletion,
+  `schtasks`, the registry `Run` key). Paths on another machine (`\\host\share`) are refused. Write your own
+  `secret_files` patterns with `/`: airlock compares every path in that form.
 - **It runs inside Hermes.** For hard isolation, run the agent's terminal on an isolated backend (Docker, SSH) and
   keep your credentials where the agent's user cannot read them. airlock is built for Hermes's default in-process
   plugins: under `plugins.isolation: host` it cannot tell a third-party plugin's tools from Hermes's own, and

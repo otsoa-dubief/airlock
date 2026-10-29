@@ -90,6 +90,18 @@ policy file: they can switch airlock off.
   address or runs a file; a command written in an unusual way can escape them. They narrow the path, they do not
   close it: run agents where the metadata service is unreachable (IMDSv2 with a hop limit of 1, a firewall rule) and
   where sensitive files are out of reach.
+- **Windows.** File tools, places, secret names, attachments and `file:` URLs are read as on macOS and Linux, in
+  every form Windows gives a path (backslashes, Git Bash's `/c/...`, `\\?\`, the local `C$` share, NTFS streams,
+  trailing dots, Git Bash's `/tmp`). Commands are read as Git Bash runs them; PowerShell and `cmd` syntax is not
+  parsed, beyond the deletion, persistence and encoded-code patterns of the default policy. Git Bash's `/` is
+  translated to the Git folder when airlock can find the bash Hermes runs, and a path with no drive is checked both
+  there and on the current drive. A path a file tool, an attachment or the
+  browser would open on another machine is refused and never resolved (resolving it would already connect to it);
+  in a command, only a `\\host\share` path is: `ls //server`, `start \\server` or a script written to reach a
+  share later still connect, and Windows may send the user's NTLM credentials. Block outbound SMB (port 445) on a
+  machine that runs an agent. A protected path with a space, reached through `cd`, a variable or `$'...'` in a
+  command, is not read; neither is a file deleted through a computed `cmd` or PowerShell command. The test suite
+  runs on Windows in CI; Hermes itself is tested end to end in its official Linux image only.
 - **Text-level parsing limits.** airlock parses shell and inline code conservatively and refuses what it cannot
   read, but it is not a shell interpreter. Report anything that slips through (see [SECURITY.md](../SECURITY.md)),
   with the exact tool call.

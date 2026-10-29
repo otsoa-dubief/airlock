@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.2.4 — 2026-10-29
+
+- Security (GHSA-w8j8-5ph5-rrff): on Windows, the walls on folders never matched a path inside them, because
+  Windows writes paths with backslashes and airlock compared with `/` only. Writes to `memories`, `skills`, `cron`,
+  `plugins` (airlock's own folder included) and `hooks` went through, as did reads of airlock's data and of other
+  profiles; from a named profile, `{hermes_root}` was the profile itself; 10 of 15 secret file names tried
+  (`.env`, `id_rsa`, `.netrc`, `token.json`, a `secrets` folder...) were not recognized. Every path airlock
+  compares is now in one form, with forward slashes, and the test suite runs on Windows in CI, where the report's
+  cases are decided as on macOS and Linux. Reported by jeanpaul-source.
+- Same fix, the other names Windows gives one file: Git Bash's `/c/...`, `/cygdrive/c/...`,
+  `/proc/cygdrive/c/...` and `/mnt/c/...` (Hermes's terminal on Windows is Git Bash, and its file tools translate
+  them, `..` resolved first as Git Bash does), Git Bash's `/tmp` (the user's temp folder, where a junction can lead
+  anywhere) and its `/` (Git's own folder, found from the bash Hermes runs; a path with no drive is checked both
+  there and on the current drive, where Python and the browser open it), the `\\?\`, `\\.\` and
+  `\??\` prefixes, the local administrative share (`\\localhost\C$\...`, also as `file://localhost/C$/...`),
+  NTFS streams (`file::$DATA`, `dir::$INDEX_ALLOCATION`), trailing dots and spaces (`.env.`), a path with no drive,
+  case, `file:///C:/...` in the browser, `C:\...` after `MEDIA:`, and `$USERPROFILE`, `$APPDATA` and
+  `$LOCALAPPDATA` in commands and code. Links and junctions are followed as before.
+- Another machine: on Windows, a file tool, an attachment or a `file:` URL that names a `\\server` path (a server
+  alone included) is blocked, and so is a command that cites a `\\host\share` path (a Git Bash `//switch` is not
+  one). Such a path is never resolved, listed or tested to decide: on Windows that alone connects to the machine
+  and can send the user's NTLM credentials. No name lookup is made to decide either.
+- Default policy, Windows places: saved credentials and DPAPI keys, Chrome, Edge, Brave and Firefox profiles,
+  `gcloud` and GitHub CLI logins (never read nor written); the Startup folder and PowerShell profiles, OneDrive's
+  included (never written). Deleting a drive root or the user's profile, from Git Bash, `cmd` or PowerShell, is a
+  destructive deletion; so is deleting, through `cmd` (`rd`, `del`) or PowerShell (`Remove-Item`), a protected path
+  or a folder that holds one, named in the command, as `-Path:`, piped in from `Get-ChildItem`, or below a `cd`. Persistence: `schtasks //create` (Git Bash), `Register-ScheduledTask`, `reg import`,
+  WMI event subscriptions, and the registry keys Windows runs at logon or with every `cmd` (`CurrentVersion\Run`,
+  `User Shell Folders`, `UserInitMprLogonScript`, `Winlogon`, `Command Processor\AutoRun`). PowerShell given
+  encoded code (`-EncodedCommand`, `-enc`, `-e`) is a bypass: nothing in it can be read. `setx HERMES_HOME`,
+  `$env:HERMES_HOME =`, `set HERMES_HOME=` and `Set-Item Env:HERMES_HOME` borrow an identity.
+- Everywhere:
+  - a command that writes a protected path with a space in it, written in the command (`echo x >
+    '~/Library/Application Support/...'`, `cp`, `tee`), is read whole; it was cut at the space. The same path
+    reached through a `cd`, a variable or `$'...'` is not read: see the threat model;
+  - `rm -r` of a folder that holds a protected path is blocked (deleting a parent of `~/.ssh` deletes `~/.ssh`).
+- False match fixed: a file being written that contains `hermes_home=` or a Python variable `HERMES_HOME = ...` no
+  longer hits the identity wall (the wall reads a shell assignment, `HERMES_HOME=`, with the variable's case outside
+  Windows, where environment names are case-sensitive). A protocol-relative URL (`//cdn...`) in a file being written
+  is not a path.
+- A media path holding a NUL byte no longer raises on Python versions whose `realpath` accepts it.
+
 ## 0.2.3 — 2026-10-28
 
 - Security (GHSA-mgf8-gh7g-q4rg): with `approvals_off: block` (the default), an action airlock sends for approval

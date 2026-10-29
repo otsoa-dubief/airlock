@@ -15,14 +15,15 @@ policy = importlib.import_module(f"{PKG}.policy")
 rules = importlib.import_module(f"{PKG}.rules")
 shell = importlib.import_module(f"{PKG}.shell")
 
-HOME = os.path.realpath(os.path.expanduser("~"))
-HERMES = os.path.join(HOME, ".hermes")
+# In airlock's canonical form (forward slashes on Windows too), as the plugin computes its places.
+HOME = shell.real(os.path.expanduser("~"))
+HERMES = HOME + "/.hermes"
 
 
 def places(**over):
     p = {"home": HOME, "hermes_home": HERMES, "hermes_root": HERMES,
-         "plugin_dir": os.path.join(HERMES, "plugins", "airlock"), "policy_file": os.path.join(HERMES, "airlock.yaml"),
-         "data_dir": os.path.join(HERMES, "plugin-data", "airlock")}
+         "plugin_dir": HERMES + "/plugins/airlock", "policy_file": HERMES + "/airlock.yaml",
+         "data_dir": HERMES + "/plugin-data/airlock"}
     p.update(over)
     return p
 
@@ -35,7 +36,7 @@ def pol():
 @pytest.fixture
 def make_ctx():
     def make(**kw):
-        base = dict(cwd=os.path.join(HOME, "project"), home=HOME, hermes_home=HERMES, hermes_root=HERMES,
+        base = dict(cwd=HOME + "/project", home=HOME, hermes_home=HERMES, hermes_root=HERMES,
                     profile="default", owners={"123456"})
         base.update(kw)
         return rules.Context(**base)

@@ -1,6 +1,7 @@
 """The plugin glue: hooks, journal, taint persistence, observe mode, stop switch, slash command."""
 import json
 import os
+import sys
 
 import pytest
 
@@ -313,7 +314,7 @@ def test_a_symlink_made_later_is_resolved(tmp_path):
     before = shell.normalize("link/key", str(tmp_path))
     (tmp_path / "link").symlink_to(target)
     shell.new_decision()                     # what rules.decide does at the start of every tool call
-    assert shell.normalize("link/key", str(tmp_path)) == str((target / "key").resolve()) != before
+    assert shell.normalize("link/key", str(tmp_path)) == shell.real(str((target / "key").resolve())) != before
 
 
 def test_normalize_survives_a_concurrent_cache_clear():
@@ -597,7 +598,7 @@ def test_journal_masks_the_canary_and_secrets(plugin):
     call(plugin, "web_search", {"query": m}, session="j1")
     call(plugin, "send_message", {"action": "send", "target": "telegram:5",
                                   "message": "ghp_aB3dEfGhIjKlMnOpQrStUvWxYz0123456789"}, session="j2")
-    text = (plugin.data / "journal.jsonl").read_text()
+    text = (plugin.data / "journal.jsonl").read_text(encoding="utf-8")
     assert m.split("-", 1)[1] not in text and "ghp_aB3dEf" not in text and "«marker»" in text and "«secret»" in text
 
 
@@ -661,6 +662,7 @@ def test_a_secret_in_a_second_attachment_after_a_big_first_one(plugin, tmp_path)
     assert r["action"] == "block" and "secret" in r["message"].lower()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="a colon cannot be in a Windows file name")
 def test_attachments_crossing_a_tag_or_naming_a_variable(plugin, tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / ".ssh").mkdir(parents=True)

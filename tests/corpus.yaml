@@ -137,7 +137,7 @@
 - {name: busybox tar, tool: terminal, args: {command: "busybox tar -xf e.tar -C ~/Library/LaunchAgents"}, expect: block}
 - {name: unzip into home, tool: terminal, args: {command: "unzip -o payload.zip -d ~/"}, expect: block}
 - {name: 7z into plugins, tool: terminal, args: {command: "7z x evil.7z -o~/.hermes/plugins"}, expect: block}
-- {name: cpio into etc, tool: terminal, args: {command: "cpio -idv -D /etc < a.cpio"}, expect: block}
+- {name: cpio into etc, tool: terminal, args: {command: "cpio -idv -D /etc < a.cpio"}, expect: block, posix_only: true}
 - {name: tar extracted inside a protected cwd, tool: terminal, args: {command: "cd ~/.hermes/plugins && tar xf /tmp/e.tar"}, expect: block}
 - {name: python extractall into plugins, tool: execute_code, args: {code: "import tarfile
 tarfile.open('/tmp/e.tar').extractall('~/.hermes/plugins')"}, expect: block}

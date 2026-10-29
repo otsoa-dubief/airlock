@@ -150,13 +150,15 @@ class Policy:
         out = re.sub(r"\{(\w+)\}", sub, value)
         if missing:
             return "" if not keep_unknown else out
-        return os.path.realpath(os.path.expanduser(out)) if not keep_unknown else out
+        return shell.real(os.path.expanduser(out)) if not keep_unknown else out
 
     def _compile(self, patterns, where, flags=0):
         out = []
         for p in patterns:
             if not p:
                 continue
+            if shell.WINDOWS:                   # environment names and paths are case-insensitive there
+                p = str(p).replace("(?-i:", "(?:")
             try:
                 out.append(re.compile(str(p), flags))
             except re.error as e:

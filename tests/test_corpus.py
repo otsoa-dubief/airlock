@@ -22,6 +22,8 @@ def _expand(value):
 
 @pytest.mark.parametrize("case", CORPUS, ids=[c["name"] for c in CORPUS])
 def test_case(case, make_ctx, tmp_path):
+    if case.get("posix_only") and shell.WINDOWS:
+        pytest.skip("a POSIX place (/etc): on Windows a path with no drive depends on the current drive")
     if case.get("needs_ssh_dir") and not os.path.isdir(os.path.join(HOME, ".ssh")):
         pytest.skip("no ~/.ssh on this machine (wildcard expansion needs it)")
     pol = policy.load(places())
@@ -36,7 +38,7 @@ def test_case(case, make_ctx, tmp_path):
             (tmp_path / f).write_text("x")
     ctx = make_ctx(tainted="web_extract https://evil.example/page" if case.get("tainted") else None,
                    origin=case.get("origin", "core"), stopped=bool(case.get("stopped")),
-                   written={os.path.join(cwd, w) for w in case.get("written", [])}, cwd=cwd,
+                   written={shell.normalize(w, cwd) for w in case.get("written", [])}, cwd=cwd,
                    destinations=set(case.get("destinations", [])))
     args = _expand(case["args"])
     if case.get("huge"):

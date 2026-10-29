@@ -85,6 +85,17 @@ walls:
     - "{home}/Library/Safari"
     - "{home}/.config/google-chrome"
     - "{home}/.mozilla"
+    # Windows: saved credentials, DPAPI master keys, browser profiles, CLI logins
+    - "{home}/AppData/Roaming/Microsoft/Credentials"
+    - "{home}/AppData/Local/Microsoft/Credentials"
+    - "{home}/AppData/Roaming/Microsoft/Protect"
+    - "{home}/AppData/Roaming/Microsoft/Crypto"
+    - "{home}/AppData/Local/Google/Chrome/User Data"
+    - "{home}/AppData/Local/Microsoft/Edge/User Data"
+    - "{home}/AppData/Local/BraveSoftware/Brave-Browser/User Data"
+    - "{home}/AppData/Roaming/Mozilla/Firefox"
+    - "{home}/AppData/Roaming/gcloud"
+    - "{home}/AppData/Roaming/GitHub CLI"
     - "{hermes_home}/auth.json"
     - "{hermes_home}/.env"
     - "{hermes_root}/auth.json"
@@ -113,6 +124,11 @@ walls:
     - "{home}/Library/LaunchAgents"
     - "{home}/.config/systemd/user"
     - "{home}/.config/autostart"
+    - "{home}/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup"
+    - "{home}/Documents/PowerShell"
+    - "{home}/Documents/WindowsPowerShell"
+    - "{home}/OneDrive/Documents/PowerShell"
+    - "{home}/OneDrive/Documents/WindowsPowerShell"
     - "/etc"
     - "/Library/LaunchDaemons"
     - "/Library/LaunchAgents"
@@ -157,14 +173,21 @@ walls:
       pattern: '--yolo\b|\bHERMES_YOLO\w*\s*=|\bapprovals?[._]mode\b'
       reason: "approvals cannot be turned off from inside a session"
     - id: identity
-      pattern: '\bHERMES_HOME\s*=|\bexport\s+HERMES_HOME\b|\benv\b(\s+-\S+)*\s+(-[a-zA-Z]*[iu]\b|--ignore-environment|--unset)|\bunset\s+HERMES_HOME\b|\bos\.environ\s*\[\s*["'']HERMES_HOME["'']\s*\]\s*=|\bputenv\s*\(\s*["'']HERMES_HOME'
+      # HERMES_HOME= as a shell assignment (no space), PowerShell and cmd. (?-i:...) keeps the variable's case where
+      # names are case-sensitive (hermes_home= in code is not it); on Windows, where they are not, case is folded.
+      pattern: '(?-i:\bHERMES_HOME=(?!=))|\$env:HERMES_HOME\s*=|\bset\s+HERMES_HOME\s*=|\bexport\s+HERMES_HOME\b|\bsetx\s+HERMES_HOME\b|\b(Set|New)-Item\s+["'']?Env:[\\/]?HERMES_HOME\b|\bSetEnvironmentVariable\s*\(\s*["'']HERMES_HOME|\benv\b(\s+-\S+)*\s+(-[a-zA-Z]*[iu]\b|--ignore-environment|--unset)|\bunset\s+HERMES_HOME\b|\bos\.environ\s*\[\s*["'']HERMES_HOME["'']\s*\]\s*=|\bputenv\s*\(\s*["'']HERMES_HOME'
       reason: "each agent acts under its own profile: changing HERMES_HOME or emptying the environment would borrow another identity (reading $HERMES_HOME is fine)"
   # Deletions that would destroy a home directory, a repository or Hermes's own data.
   destructive:
     - '\brm\s+(-[a-zA-Z]*[rR][a-zA-Z]*\s+)+["'']?(~|\$HOME|\{home\}|/)/?\*?["'']?(\s|$)'
     - '\brm\s+(-[a-zA-Z]*[rR][a-zA-Z]*\s+)+[^\n;&|]*(\.hermes|\.git)/?["'']?(\s|$)'
+    # Windows, as Git Bash writes it: the profile folder or a drive root (C:, /c, /cygdrive/c); and the same targets
+    # deleted through cmd or PowerShell (airlock does not read their paths otherwise).
+    - '\brm\s+(-[a-zA-Z]*[rR][a-zA-Z]*\s+)+["'']?(\$\{?USERPROFILE\}?|%USERPROFILE%|[A-Za-z]:|/[a-zA-Z]|/(cygdrive|mnt)/[a-zA-Z])[\\/]?\*?["'']?(\s|$)'
+    - '(?i)\bcmd(\.exe)?\b[^\n;&|]*\s//?c\b[^\n;&|]*\b(rd|rmdir|del|erase)\b(?=[^\n;&|]*\s//?s\b)[^\n;&|]*\s["'']?([a-z]:[\\/]*|%USERPROFILE%[\\/]*|%HOMEDRIVE%%HOMEPATH%[\\/]*)["'']?(\s|$)'
+    - '(?i)\b(powershell|pwsh)(\.exe)?\b[^\n;&|]*\b(Remove-Item|rm|ri|del|rd|rmdir)\b(?=[^\n;&|]*\s-r(ecurse)?\b)[^\n;&|]*\s["'']?([a-z]:[\\/]*|\$env:USERPROFILE[\\/]*|\$HOME[\\/]*|~[\\/]*)["'']?(\s|$)'
     - '\bgit\b[^\n;&|]*\bclean\b[^\n;&|]*\s-[a-zA-Z]*[xX]'
-    - '\bfind\s+["'']?(~|/|\$HOME)["'']?\s[^\n;&|]*-delete\b'
+    - '\bfind\s+["'']?(~|/|\$HOME|\$\{?USERPROFILE\}?|[A-Za-z]:[\\/]?|/[a-zA-Z]/?)["'']?\s[^\n;&|]*-delete\b'
     - '\bmkfs(\.\w+)?\b|\bdd\b[^\n;&|]*\bof=/dev/(sd|disk|nvme|hd)'
 
 # Built-in detectors of outbound actions, by category. Add your own (same shape) in your policy; a pattern is a
@@ -201,7 +224,9 @@ egress:
   - {id: hermes-install, category: install, pattern: '\bhermes\b[^\n;&|]*\b(plugins?|skills?|mcp|hooks)\s+(install|add|enable|update|tap|adopt)\b'}
   # --- persistence
   - {id: crontab, category: persistence, pattern: '\bcrontab\b(?![^\n;&|]*\s-l\b)'}
-  - {id: launch-agents, category: persistence, pattern: '\blaunchctl\s+(load|bootstrap|enable|submit|kickstart)\b|\bsystemctl\s+(--user\s+)?(enable|link|edit|set-property)\b|\bschtasks\s+/create\b'}
+  - {id: launch-agents, category: persistence, pattern: '\blaunchctl\s+(load|bootstrap|enable|submit|kickstart)\b|\bsystemctl\s+(--user\s+)?(enable|link|edit|set-property)\b|(?i:\bschtasks(\.exe)?\s+//?create\b)|(?i:\breg(\.exe)?\s+import\b|\bRegister-ScheduledTask\b|\bNew-ScheduledTask\w*\b)'}
+  # Registry keys Windows runs at logon; read on the raw text, since the key is often a quoted path with spaces.
+  - {id: windows-autorun, category: persistence, match: raw, pattern: '(?i)\b(reg(\.exe)?\s+add|New-ItemProperty|Set-ItemProperty|New-Item|Set-Item)\b[^\n;&|]*(CurrentVersion[\\/]*Run|User\W{0,3}Shell\W{0,3}Folders|UserInitMprLogonScript|Winlogon|Command\W{0,3}Processor|ms-settings[\\/]+shell)|\bwmic\b[^\n;&|]*\b(EventFilter|CommandLineEventConsumer|FilterToConsumerBinding)\b|\bRegister-(Cim|Wmi)Event\b'}
   - {id: git-run-later, category: persistence, pattern: '\bgit\b[^\n;&|]*\bconfig\b[^\n;&|]*\b(core\.(hooksPath|fsmonitor|sshCommand|pager|editor)|alias\.\S+\s+["'']?!|filter\.\w+\.(clean|smudge))'}
   - {id: hermes-cron, category: persistence, pattern: '\bhermes\b[^\n;&|]*\bcron\s+(create|add|edit|update|resume|run)\b'}
   # --- delegation (a new agent session would start without this session's taint)

@@ -62,7 +62,7 @@ TOOL_REASONS = {
 class Context:
     """What the plugin knows around a tool call."""
     cwd: str = ""
-    home: str = os.path.expanduser("~")
+    home: str = shell.real(os.path.expanduser("~"))
     hermes_home: str = ""
     hermes_root: str = ""
     profile: str = "default"
@@ -182,10 +182,20 @@ def pretty(path, ctx):
     return "~" + path[len(home):] if home and under(path, home) else path
 
 
-def access_wall(path, pol, ctx):
-    """Reason if a path may be neither read nor written by the agent, else None."""
+REMOTE = "a path on another machine (Windows network share or device path)"
+
+
+def access_wall(path, pol, ctx, remote=True):
+    """Reason if a path may be neither read nor written by the agent, else None. remote=False leaves a //host/share
+    word alone (a protocol-relative URL in a file being written is not a path)."""
     if not path:
         return None
+    return next((r for r in (_access_wall(p, pol, ctx, remote) for p in shell.twins(path, ctx.cwd)) if r), None)
+
+
+def _access_wall(path, pol, ctx, remote):
+    if remote and shell.remote_path(path):
+        return REMOTE
     for root in pol.read_write:
         if under(path, root):
             return f"protected path ({pretty(root, ctx)})"
@@ -201,13 +211,23 @@ def access_wall(path, pol, ctx):
     return None
 
 
+def opened_wall(path, pol, ctx):
+    """access_wall for a path a tool opens itself (file tools, attachments, the browser): on Windows any \\\\ path,
+    a bare server name included, is refused, since opening it connects to that machine."""
+    return REMOTE if shell.unc(path) else access_wall(path, pol, ctx)
+
+
 def write_wall(path, pol, ctx):
     """Reason if a path may not be written by the agent (read is fine), else None."""
     if not path:
         return None
-    for root in pol.write_only:
-        if under(path, root):
-            return f"guard, configuration or startup file ({pretty(root, ctx)}): readable, never written by the agent"
+    if shell.unc(path):
+        return REMOTE
+    for p in shell.twins(path, ctx.cwd):
+        for root in pol.write_only:
+            if under(p, root):
+                return f"guard, configuration or startup file ({pretty(root, ctx)}): readable, never written by the " \
+                       "agent"
     return access_wall(path, pol, ctx)
 
 
@@ -218,17 +238,17 @@ def _protected_matcher(pol, ctx, cwd):
 
     def path_protected(c):
         if c not in seen_path:
-            p = shell.normalize(c, cwd)
-            seen_path[c] = any(under(p, r) for r in roots) or any(rx.search(p) for rx in pol.secret_files) or \
-                bool(pol.isolate_profiles and ctx.hermes_root and
-                     access_wall(p, pol, ctx) == "another Hermes profile's data")
+            seen_path[c] = any(any(under(p, r) for r in roots) or any(rx.search(p) for rx in pol.secret_files) or
+                               bool(pol.isolate_profiles and ctx.hermes_root and
+                                    access_wall(p, pol, ctx) == "another Hermes profile's data")
+                               for p in shell.twins(shell.normalize(c, cwd), cwd))
         return seen_path[c]
 
     def protected(raw):
         raw = raw or ""
         if raw not in seen_raw:
-            cands = [m.group(0) for m in shell.CITED_PATH.finditer(shell.fold(raw))]
-            cands += [t for t in re.split(r"[\s\"'=;&|<>(),]+", raw) if t]
+            cands = [m.group(0) for m in shell.cited_paths().finditer(shell.fold(raw))]
+            cands += [t for t in re.split(r"[\s\"'=;&|<>(),]+", raw) if t] + shell.quoted_words(raw) + [raw.strip()]
             seen_raw[raw] = any(path_protected(c) for c in dict.fromkeys(cands))
         return seen_raw[raw]
     protected.roots, protected.cwd = roots, cwd
@@ -283,8 +303,10 @@ MEDIA_END = re.compile(r"[\s`\"'*_,;:.<)\]}\[\u3000-\u303f\uff00-\uffef]|MEDIA:"
 SIMPLEX_MEDIA = re.compile(r"MEDIA:(\S+)")    # SimpleX reads the cleaned text again, raw (adapter.send)
 # A tag as Hermes deletes it from the text it sends (path, then up to three marks and a dot): used to rebuild that
 # text when Hermes's own reader is not available.
-MEDIA_DELETED = re.compile(r"[`\"'*_]{0,3}MEDIA:\s*(\"[^\"\n]+\"|'[^'\n]+'|`[^`\n]+`|[~/][^\s`\"'*_,;:)\]}\[]*)"
+MEDIA_DELETED = re.compile(r"[`\"'*_]{0,3}MEDIA:\s*(\"[^\"\n]+\"|'[^'\n]+'|`[^`\n]+`|"
+                           r"(?:[~/]|[A-Za-z]:[\\/]|\\\\)[^\s`\"'*_,;:)\]}\[]*)"
                            r"[`\"'*_]{0,3}\.?", re.I)
+WIN_ROOT = re.compile(r"[A-Za-z]:[\\/]|\\\\")
 MEDIA_MAX_ENDS = 300            # an unquoted path with more possible ends than this is not read: the call is refused
 MEDIA_MAX_CANDIDATES = 5_000    # same for a message whose tags give more candidate paths than this (a decision is fast)
 MEDIA_MAX_PATH = 4096           # longest path a system opens: nothing past it is read after a tag
@@ -317,16 +339,18 @@ def media_candidates(text):
             out += [(quoted, True), (quoted.rstrip(",.;:)}]"), True)]     # as Hermes's _normalize_media_tag_path
             continue
         seg = seg.lstrip("\"'`*_")
-        if not seg.startswith(("~", "/")):
+        drive = shell.WINDOWS and bool(WIN_ROOT.match(seg))             # C:\..., C:/... or \\host\...
+        if not (seg.startswith(("~", "/")) or drive):
             continue
+        start = 3 if drive and seg[1] == ":" else 1                     # the drive's own colon ends nothing
         ends = []
-        for x in MEDIA_END.finditer(seg):
+        for x in MEDIA_END.finditer(seg, start):
             if x.start():
                 ends.append(x.start())
             if len(ends) > MEDIA_MAX_ENDS:
                 overflow = True
                 break
-        first = HERMES_END.search(seg, 1)
+        first = HERMES_END.search(seg, start)
         sure = first.start() if first else len(seg)
         for end in dict.fromkeys(ends[:MEDIA_MAX_ENDS] + [sure, len(seg)]):
             out.append((seg[:end].rstrip(), end == sure))
@@ -335,7 +359,7 @@ def media_candidates(text):
 
 def attachment_path(path, cwd):
     """A path as Hermes opens it: ~ expanded, never variables ($HOME stays a directory name), links resolved."""
-    return os.path.realpath(os.path.join(cwd or "/", os.path.expanduser(str(path).strip())))
+    return shell.real(shell.joined(cwd, path))
 
 
 def attached(args, ctx):
@@ -383,9 +407,10 @@ def attached(args, ctx):
     out = []
     for p, sure in dict.fromkeys(cands):
         try:
-            joined = os.path.join(ctx.cwd or "/", os.path.expanduser(str(p).strip()))
-            if sure or os.path.lexists(joined):                  # the cheap test first: most candidates are not files
-                out.append(os.path.realpath(joined))
+            joined = shell.joined(ctx.cwd, p)
+            # The cheap test first: most candidates are not files. A \\\\ path is never tested (see shell.unc).
+            if sure or shell.unc(joined) or os.path.lexists(joined):
+                out.append(shell.real(joined))
         except ValueError:                                       # a NUL byte: no file can be opened by that name
             continue
     _attached_cache[key] = result = (list(dict.fromkeys(out)), overflow, hermes)
@@ -401,11 +426,11 @@ def attachment_texts(pol, tool, args, ctx):
         return []
     out = []
     for path in attached(args, ctx)[0]:
-        if access_wall(path, pol, ctx):
+        if opened_wall(path, pol, ctx):                          # never opened: refused, or another machine
             continue
         try:                                                     # non-blocking: a FIFO swapped in must not hang
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-        except OSError:
+        except (OSError, ValueError):                           # ValueError: a NUL byte, no file has that name
             continue
         try:
             if stat.S_ISREG(os.fstat(fd).st_mode):
@@ -580,14 +605,14 @@ def walls(pol, tool, args, ctx):
             if not p:
                 continue
             n = shell.normalize(p, cwd)
-            r = write_wall(n, pol, ctx) if tool in FILE_WRITE_TOOLS else access_wall(n, pol, ctx)
+            r = write_wall(n, pol, ctx) if tool in FILE_WRITE_TOOLS else opened_wall(n, pol, ctx)
             if r:
                 return Decision("block", "wall", r, "walls.paths", True)
         if tool in FILE_WRITE_TOOLS:
             content = str(args.get("content") or args.get("patch") or args.get("new_string") or "")
             written = str(args.get("path") or args.get("file_path") or "")
-            if content and not written.lower().endswith((".md", ".txt", ".rst")):
-                d = command_walls(pol, content, ctx, cwd, code=True)
+            if content and not shell.as_named(written).lower().endswith((".md", ".txt", ".rst")):
+                d = command_walls(pol, content, ctx, cwd, code=True, content=True)
                 if d:
                     d.reason += " (in a file being written)"
                     return d
@@ -601,7 +626,7 @@ def walls(pol, tool, args, ctx):
         return command_walls(pol, text, ctx, leading_cd(text, cwd), code=tool == "execute_code")
     if tool in ATTACHING_TOOLS:
         for p in attached(args, ctx)[0]:
-            r = access_wall(p, pol, ctx)
+            r = opened_wall(p, pol, ctx)
             if r:
                 return Decision("block", "wall", f"attaches a file the agent may not read: {r}", "walls.paths", True)
         return None
@@ -609,7 +634,7 @@ def walls(pol, tool, args, ctx):
         for t in _texts(args):
             for u in re.findall(r"file:[^\s\"'`<>)\]]+", t, re.I):
                 try:
-                    r = access_wall(shell.normalize(unquote(urlparse(u).path)), pol, ctx)
+                    r = opened_wall(shell.normalize(shell.file_url_path(u)), pol, ctx)
                 except ValueError:
                     r = None
                 if r:
@@ -765,7 +790,7 @@ def command_text(tool, args):
     return ""
 
 
-def command_walls(pol, text, ctx, cwd, code=False):
+def command_walls(pol, text, ctx, cwd, code=False, content=False):
     for t in shell.variants(text):
         for cid, rx, reason in pol.commands:
             if rx.search(t):
@@ -774,14 +799,14 @@ def command_walls(pol, text, ctx, cwd, code=False):
             if rx.search(t):
                 return Decision("block", "wall", "destructive deletion (home, root, repository or Hermes data)",
                                 "walls.destructive", True)
-    r = shell.find_cited_path(text, cwd, lambda p: access_wall(p, pol, ctx))
+    r = shell.find_cited_path(text, cwd, lambda p: access_wall(p, pol, ctx, remote=not content))
     if not r:
         for word in (shell.code_strings(text) if code else []) + shell.bare_words(text):
             paths = [shell.normalize(word, cwd)]
-            if shell.GLOB_CHARS.search(word):
-                paths += [os.path.realpath(p) for p in itertools.islice(
-                    glob.iglob(os.path.join(cwd or "", os.path.expanduser(word))), 200)]
-            r = next((x for x in (access_wall(p, pol, ctx) for p in paths) if x), None)
+            pattern = shell.joined(cwd, word)
+            if shell.GLOB_CHARS.search(word) and not shell.unc(pattern):
+                paths += [shell.real(p) for p in itertools.islice(glob.iglob(pattern), 200)]
+            r = next((x for x in (access_wall(p, pol, ctx, remote=not content) for p in paths) if x), None)
             if r:
                 break
     if r:
@@ -861,10 +886,11 @@ def categories(pol, tool, args, ctx):
             cwd = leading_cd(text, ctx.cwd)
 
             def persistent(raw):
-                cands = [m.group(0) for m in shell.CITED_PATH.finditer(shell.fold(raw or ""))]
-                cands += [t for t in re.split(r"[\s\"'=;&|<>(),]+", raw or "") if t]
+                cands = [m.group(0) for m in shell.cited_paths().finditer(shell.fold(raw or ""))]
+                cands += [t for t in re.split(r"[\s\"'=;&|<>(),]+", raw or "") if t] + shell.quoted_words(raw) + \
+                    [(raw or "").strip()]
                 return any(any(under(n, r) for r in roots) or bool(GIT_HOOKS.search(n))
-                           for n in (shell.normalize(c, cwd) for c in cands))
+                           for c in cands for n in shell.twins(shell.normalize(c, cwd), cwd))
             if shell.writes_protected(text, persistent):
                 hit = "the agent's memory, skills or scheduled jobs"
         if hit:
@@ -872,7 +898,7 @@ def categories(pol, tool, args, ctx):
     if tool in FILE_WRITE_TOOLS and ctx.tainted:
         content = str(args.get("content") or args.get("patch") or args.get("new_string") or "")
         path = str(args.get("path") or args.get("file_path") or "")
-        if content and SCRIPT_EXT.search(path):
+        if content and SCRIPT_EXT.search(shell.as_named(path)):
             for rid, cat, rx, _ in pol.egress:
                 if rx.search(content) or rx.search(shell.unmask(content)):
                     found.append((cat, f"a script that {_describe(rid, rx, content, cat)}", f"egress.{rid}"))
@@ -1161,7 +1187,8 @@ def _decide(pol, tool, args, ctx, texts):
     if tool in FILE_WRITE_TOOLS and ctx.tainted:
         content = str(args.get("content") or "")
         path = str(args.get("path") or args.get("file_path") or "")
-        if content and SCRIPT_EXT.search(path) and shell.bypass(content) and not path.lower().endswith(".py"):
+        if content and SCRIPT_EXT.search(shell.as_named(path)) and shell.bypass(content) and \
+                not shell.as_named(path).lower().endswith(".py"):
             worst = Decision(pol.action("bypass", True), "bypass", "a script that computes or hides what it runs, "
                              "written after reading untrusted content", "bypass.written")
     found = categories(pol, tool, args, ctx)

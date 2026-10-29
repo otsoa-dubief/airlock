@@ -26,6 +26,21 @@ jobs:
       - run: cd tests && python -m pytest -q
       - run: python demo/replay.py
 
+  windows:
+    # Windows paths (GHSA-w8j8-5ph5-rrff): the whole suite, plus what only Windows shows (tests/test_windows.py).
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install pytest pyyaml ruamel.yaml
+      - run: cd tests && python -m pytest -q -rs
+      - run: python demo/replay.py
+
   hermes:
     runs-on: ubuntu-latest
     steps:

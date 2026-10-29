@@ -18,6 +18,7 @@ import functools
 import glob
 import itertools
 import os
+import posixpath
 import re
 import shlex
 import sys
@@ -27,6 +28,10 @@ from dataclasses import dataclass, field
 # case-insensitive filesystem (macOS, Windows) ``cat ~/.SSH/ID_RSA`` reads ~/.ssh/id_rsa, so the match must
 # fold case too, or every path wall is bypassed by changing the case of a letter.
 CASE_INSENSITIVE_FS = sys.platform in ("darwin", "win32")
+
+# On Windows every path is compared in one canonical form, with forward slashes (see real()). A test may set this
+# flag on another system to exercise the Windows reading; it is read at call time.
+WINDOWS = sys.platform == "win32"
 
 # --- Parsing ----------------------------------------------------------------------------------------------------
 
@@ -252,14 +257,34 @@ def unmask(text: str) -> str:
     return re.sub(r"[\"'`\\\\]", "", t)
 
 
+# Folders Windows names by a variable (Git Bash: $APPDATA; cmd: %APPDATA%; code: os.environ["APPDATA"]).
+WIN_FOLDERS = re.compile(r"\$\{(APPDATA|LOCALAPPDATA)\}|\$(APPDATA|LOCALAPPDATA)(?!\w)|%(APPDATA|LOCALAPPDATA)%|"
+                         r"(?P<code>os\.environ\[\s*[\"'](APPDATA|LOCALAPPDATA)[\"']\s*\]|"
+                         r"(?:os\.environ\.get|(?:os\.)?getenv)\(\s*[\"'](APPDATA|LOCALAPPDATA)[\"']\s*\))", re.I)
+
+
+def _win_folder(m):
+    name = next(g for g in m.groups()[::-1] if g and g.upper() in ("APPDATA", "LOCALAPPDATA")).upper()
+    value = os.environ.get(name)
+    if not value:
+        return m.group(0)
+    value = value.replace("\\", "/")
+    return f'"{value}"' if m.group("code") else value      # a quoted string in code, so 'x' + "/y" folds
+
+
 def fold(text: str) -> str:
     """Path fragments joined back together: 'sec'+'rets', Path.home()/'.ssh', os.path.join('~', '.aws'), m[a]in,
     empty quotes. Used to find a protected path written in pieces."""
     t = text or ""
     t = re.sub(r"__import__\(\s*[\"']os[\"']\s*\)", "os", t)
-    t = re.sub(r"Path\.home\(\)|(os\.)?path\.expanduser\(\s*[\"']~/?[\"']\s*\)|os\.environ\[\s*[\"']HOME[\"']\s*\]|"
-               r"os\.environ\.get\(\s*[\"']HOME[\"']\s*\)|(os\.)?getenv\(\s*[\"']HOME[\"']\s*\)|\$\{?HOME\}?",
+    t = re.sub(r"Path\.home\(\)|(os\.)?path\.expanduser\(\s*[\"']~/?[\"']\s*\)|"
+               r"os\.environ\[\s*[\"'](HOME|USERPROFILE)[\"']\s*\]|"
+               r"os\.environ\.get\(\s*[\"'](HOME|USERPROFILE)[\"']\s*\)|"
+               r"(os\.)?getenv\(\s*[\"'](HOME|USERPROFILE)[\"']\s*\)|\$\{(HOME|USERPROFILE)\}|"
+               r"\$\{?HOMEDRIVE\}?\$\{?HOMEPATH\}?|%HOMEDRIVE%%HOMEPATH%|\$(HOME|USERPROFILE)(?!\w)|%USERPROFILE%",
                "~", t)
+    if WINDOWS:
+        t = WIN_FOLDERS.sub(_win_folder, t)
     t = re.sub(r"\.joinpath\(\s*[\"']", "/'", t)
     t = re.sub(r"(os\.)?path\.join\(([^()\n]*)\)",
                lambda m: re.sub(r"[\"']\s*,\s*[\"']", "/", re.sub(r"^\s*~\s*,\s*[\"']", "~/", m.group(2))), t)
@@ -298,6 +323,15 @@ def variants(text: str) -> list:
 # --- Paths cited in a command -----------------------------------------------------------------------------------
 
 CITED_PATH = re.compile(r"(?<![\w:/.~-])(~|\.{1,2}/|/)[^\s\"'`;&|<>(),]*")
+# On Windows a path also starts with a drive (C:/, C:\) or a share (\\host); Git Bash's /c/... is already a "/".
+CITED_PATH_WIN = re.compile(r"(?<![\w:/.~\\-])(~|\.{1,2}/|/|[A-Za-z]:[\\/]|\\\\|\\(?=\w))[^\s\"'`;&|<>(),]*")
+
+
+def cited_paths():
+    """The pattern of a path cited in a command, for the system airlock runs on."""
+    return CITED_PATH_WIN if WINDOWS else CITED_PATH
+
+
 GLOB_CHARS = re.compile(r"[*?\[]")
 
 
@@ -316,12 +350,12 @@ def normalize(path, cwd=None) -> str:
     """Cached for the current decision only (see new_decision). The resolved value is returned from a local,
     never re-read from the dict: another thread's new_decision() can clear the cache between the store and the
     read (the cache is process-global), and a KeyError there would be swallowed by post_tool_call and drop a taint."""
-    key = (str(path) if path else "", cwd or "")
+    key = (str(path) if path else "", cwd or "", WINDOWS)
     val = _normalized.get(key, _MISSING)
     if val is _MISSING:
         if len(_normalized) > 20000:
             _normalized.clear()
-        val = _normalize(*key)
+        val = _normalize(key[0], key[1])
         _normalized[key] = val
     return val
 
@@ -330,9 +364,186 @@ def _normalize(path, cwd) -> str:
     if not path:
         return ""
     path = os.path.expanduser(os.path.expandvars(str(path).strip()))
+    if WINDOWS:
+        path = win_canon(path)
     if not os.path.isabs(path) and cwd:
         path = os.path.join(cwd, path)
-    return os.path.realpath(path)
+    return real(path)
+
+
+# --- Windows paths ----------------------------------------------------------------------------------------------
+# Windows names one file in many ways that a prefix test on "/" never sees (GHSA-w8j8-5ph5-rrff): backslashes,
+# Git Bash's /c/... (Hermes's terminal is Git Bash, and its file tools translate /c/, /cygdrive/c/ and /mnt/c/),
+# the \\?\ and \\.\ device prefixes, the local administrative share \\localhost\C$\, NTFS streams
+# (file::$DATA, dir::$INDEX_ALLOCATION) and trailing dots or spaces, which Win32 drops (".env." opens .env).
+# win_canon() folds them into one form, C:/Users/x/..., before and after the link resolution of real().
+
+MSYS_DRIVE = re.compile(r"^/(?:(?:(?:proc/)?cygdrive|mnt)/)?([a-zA-Z])(?=/|$)")
+# Git Bash mounts its /tmp on the user's temp folder (fstab "usertemp"): a junction made there leads anywhere.
+MSYS_TMP = re.compile(r"^/tmp(?=/|$)", re.I)
+
+
+@functools.lru_cache(maxsize=32)
+def _drive_exists(letter: str) -> bool:
+    """On Windows, whether a drive exists (Git Bash reads /x as the drive X: only then, else as a folder of its own
+    root). Elsewhere, as when a test reads Windows paths on another system, every letter is a drive."""
+    if os.name != "nt":
+        return True
+    return os.path.exists(letter.upper() + ":\\")
+
+
+@functools.lru_cache(maxsize=1)
+def _git_root() -> str:
+    """The folder Git Bash calls /, from the bash Hermes runs (empty when unknown or outside Windows)."""
+    if os.name != "nt":
+        return ""
+    try:
+        from tools.environments.local import _find_bash
+        bash = _find_bash()
+    except Exception:
+        import shutil
+        bash = shutil.which("bash") or ""
+    parts = os.path.realpath(bash).replace("\\", "/").split("/") if bash else []
+    for k in range(len(parts) - 1, 0, -1):
+        if parts[k].lower() == "bin":
+            root = "/".join(parts[:k - 1] if k >= 2 and parts[k - 1].lower() == "usr" else parts[:k])
+            return root if re.match(r"[A-Za-z]:/", root) else ""
+    return ""
+WIN_DEVICE = re.compile(r"^(?://[?.]/|/\?\?/)(?:(UNC)/|([a-zA-Z]:))", re.I)   # \\?\, \\.\ and NT's \??\
+WIN_SHARE = re.compile(r"^//([^/]+)/([a-zA-Z])\$(?=/|$)")
+# //host/share/... (a bare //word is how Git Bash passes a /switch to cmd or schtasks, not a share).
+WIN_REMOTE = re.compile(r"//[^/]+/[^/]")
+LOCAL_HOSTS = {"localhost", ".", "::1", "[::1]", "0:0:0:0:0:0:0:1"}
+
+
+def _local_host(name: str) -> bool:
+    n = name.lower().rstrip(".")
+    return n in LOCAL_HOSTS or bool(re.fullmatch(r"127(\.\d{1,3}){3}", n)) or n in _machine_names()
+
+
+@functools.lru_cache(maxsize=1)
+def _machine_names():
+    """This machine's own names, read once and without any DNS query (a lookup per path would let a message slow
+    every decision down)."""
+    names = set()
+    try:
+        import socket
+        names.add(socket.gethostname().lower())
+    except Exception:
+        pass
+    for var in ("COMPUTERNAME", "HOSTNAME"):
+        if os.environ.get(var):
+            names.add(os.environ[var].lower())
+    return names
+
+
+def win_canon(path: str) -> str:
+    """A Windows path in airlock's canonical form, by text only (nothing is opened): forward slashes, Git Bash
+    drives and device prefixes translated, a local administrative share turned back into its drive, NTFS streams
+    and trailing dots or spaces removed from every component. A remote share stays //host/share/...."""
+    p = re.sub(r"^/{2,}", "//", str(path).replace("\\", "/"))   # \\\\host is \\host to Windows
+    m = WIN_DEVICE.match(p)
+    if m:
+        p = "/" + p[m.end() - 1:] if m.group(1) else p[m.start(2):]
+    elif p.startswith("/??/"):
+        p = "//?/" + p[4:]                                      # \??\GLOBALROOT...: a device path, refused
+    if p.startswith("/") and not p.startswith("//"):
+        p = posixpath.normpath(p)                               # Git Bash reads /c/../c/x as /c/x before its mounts
+    m = MSYS_TMP.match(p)
+    if m and os.environ.get("TEMP"):
+        p = os.environ["TEMP"].replace("\\", "/") + p[m.end():]
+    m = MSYS_DRIVE.match(p)
+    if m and (m.group(0) != "/" + m.group(1) or _drive_exists(m.group(1))):
+        p = m.group(1).upper() + ":" + (p[m.end():] or "/")      # /c is the root of C:, not C:'s cwd
+    elif p.startswith("/") and not p.startswith("//") and _git_root():
+        p = _git_root() + p                                     # Git Bash's / is Git's own folder
+    m = WIN_SHARE.match(p)
+    if m and _local_host(m.group(1)):
+        p = m.group(2).upper() + ":" + p[m.end():]
+    if p.startswith("//"):
+        root, rest = "//", p[2:]
+    elif re.match(r"[a-zA-Z]:", p):
+        root, rest = p[:2].upper(), p[2:]
+    else:
+        root, rest = "", p
+    lead = "/" if rest.startswith("/") and root != "//" else ""
+    parts = []
+    for part in rest.split("/"):
+        if part not in ("", ".", ".."):
+            part = part.split(":", 1)[0].rstrip(". ") or "."
+        if part:                                                 # a//b is a/b
+            parts.append(part)
+    return root + lead + "/".join(parts) + ("/" if rest.endswith("/") and parts else "")
+
+
+def remote_path(path) -> bool:
+    """True on Windows for a path that names another machine (\\\\host\\share, or a device namespace left over):
+    resolving it, listing it or testing that it exists would already open a network connection (SMB or WebDAV),
+    and with it send the user's NTLM credentials, before anyone approved anything."""
+    return WINDOWS and bool(WIN_REMOTE.match(win_canon(str(path or ""))))
+
+
+def as_named(path) -> str:
+    """A path as Windows reads its name, for tests on the name (extension, folder): canonical and lower case, so
+    run.PS1, run.sh. and run.sh::$DATA are the scripts they are. Unchanged elsewhere."""
+    return win_canon(str(path or "")).lower() if WINDOWS else str(path or "")
+
+
+def file_url_path(url) -> str:
+    """The local path a file: URL opens. On Windows: file:///C:/x and file://localhost/C|/x are C:/x,
+    file://localhost/C$/x is C:/x too (the local administrative share), and file://host/... or file:////host/...
+    name another machine (//host/...)."""
+    from urllib.parse import unquote, urlparse
+    u = urlparse(url)
+    path = unquote(u.path)
+    if not WINDOWS:
+        return path
+    m = re.match(r"/*([a-zA-Z])[:|](.*)", path, re.S)
+    if m and (not u.netloc or _local_host(u.netloc)):
+        return m.group(1) + ":" + m.group(2)
+    return win_canon("//" + u.netloc + path) if u.netloc else path
+
+
+def joined(cwd, path) -> str:
+    """path, ~ expanded (never variables), read from cwd when relative, in the canonical form on Windows; links are
+    not resolved (see real())."""
+    path = os.path.expanduser(str(path).strip())
+    if WINDOWS:
+        path = win_canon(path)
+    if cwd:
+        return os.path.join(cwd, path)
+    return path if WINDOWS else os.path.join("/", path)
+
+
+def twins(path, cwd=None) -> list:
+    """The path, and on Windows the other file a path with no drive can name. Git Bash (Hermes's terminal, and its
+    file tools on Windows) reads /x/y in Git's own folder; Python and Windows read it on the current drive. A wall
+    must hold for both."""
+    out = [path]
+    root = _git_root() if WINDOWS and path else ""
+    if root and (path == root or path.startswith(root + "/")):
+        for where in (cwd, os.getcwd()):                        # the task's drive, and the process's
+            drive = os.path.splitdrive(str(where or ""))[0].replace("\\", "/").upper()
+            twin = (drive or root[:2]) + (path[len(root):] or "/")
+            if twin not in out:
+                out.append(twin)
+    return out
+
+
+def unc(path) -> bool:
+    """True on Windows for any path that starts with \\\\ once read: such a path is never opened, listed or
+    resolved to decide (a server name alone already makes Windows look for the machine)."""
+    return WINDOWS and win_canon(str(path or "")).startswith("//")
+
+
+def real(path) -> str:
+    """os.path.realpath, in the canonical form on Windows. Never touches the disk for a remote path."""
+    if not WINDOWS:
+        return os.path.realpath(path)
+    p = win_canon(str(path))
+    if p.startswith("//"):
+        return p
+    return win_canon(os.path.realpath(p))
 
 
 def bare_words(text: str) -> list:
@@ -359,7 +570,7 @@ def find_cited_path(text: str, cwd, check):
     variable or through wildcards (each wildcard prefix is expanded: ``~/.ss*/id_*`` finds ~/.ssh). None otherwise."""
     seen = set()
     for t in variants(text or ""):
-        for m in CITED_PATH.finditer(t):
+        for m in cited_paths().finditer(t):
             c = m.group(0).rstrip(".")
             if not c or c in seen or c in ("/", "~", "./", "../"):
                 continue
@@ -372,8 +583,10 @@ def find_cited_path(text: str, cwd, check):
                 for k in range(1, len(parts) + 1):
                     if not GLOB_CHARS.search(parts[k - 1]):
                         continue
+                    if unc("/".join(parts[:k])):
+                        break
                     for found in itertools.islice(glob.iglob("/".join(parts[:k])), 200):
-                        reason = check(os.path.realpath(found))
+                        reason = check(real(found))
                         if reason:
                             return f"{reason} (matched through wildcards)"
     return None
@@ -416,12 +629,92 @@ def _holds_protected(directory, protected):
     roots = getattr(protected, "roots", None)
     if not roots or TEMP_TARGET.match(directory or ""):
         return False
-    d = normalize(directory, getattr(protected, "cwd", None))
-    if any(r == d or r.startswith(d.rstrip("/") + "/") for r in roots):
-        return True
-    if CASE_INSENSITIVE_FS:
-        dl = d.lower()
-        return any(r.lower() == dl or r.lower().startswith(dl.rstrip("/") + "/") for r in roots)
+    for d in twins(normalize(directory, getattr(protected, "cwd", None)), getattr(protected, "cwd", None)):
+        if any(r == d or r.startswith(d.rstrip("/") + "/") for r in roots):
+            return True
+        if CASE_INSENSITIVE_FS:
+            dl = d.lower()
+            if any(r.lower() == dl or r.lower().startswith(dl.rstrip("/") + "/") for r in roots):
+                return True
+    return False
+
+
+def quoted_words(text: str) -> list:
+    """Every shlex word of a text, redirection signs removed (> 'a b/c' gives a b/c): a path with a space stays
+    whole. Empty when the text cannot be split."""
+    try:
+        return [w.lstrip("0123456789&<>|") for w in shlex.split(text or "")]
+    except ValueError:
+        return []
+
+
+def redirect_targets(segment: str) -> list:
+    """The files a command line redirects its output to, read as the shell does (quotes keep spaces)."""
+    out = REDIRECTION.findall(segment)
+    try:
+        raw = shlex.split(segment, posix=True)
+    except ValueError:
+        return out
+    for i, w in enumerate(raw):
+        m = re.fullmatch(r"[\d&]?>>?\|?(.*)", w, re.S)
+        if m:
+            target = m.group(1) or (raw[i + 1] if i + 1 < len(raw) else "")
+            if target:
+                out.append(target)
+    return out
+
+
+WIN_SHELLS = {"cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"}
+WIN_DELETE_VERBS = {"rd", "rmdir", "del", "erase", "remove-item", "ri", "rm"}
+
+
+WIN_CD_VERBS = {"cd", "chdir", "set-location", "sl", "pushd"}
+
+
+def _windows_shell_deletes(w, protected) -> bool:
+    """True if cmd or PowerShell is told to delete a protected path, or (recursively) a folder that holds one:
+    cmd //c 'rd /s /q C:\\Users\\me', powershell -c 'Remove-Item -Recurse $env:USERPROFILE', a -Path: argument, a
+    folder piped in (Get-ChildItem X | Remove-Item -Recurse) or reached by a cd before. airlock does not parse these
+    shells; their deletion words are read in the text they are given."""
+    if not w or os.path.basename(w[0].replace("\\", "/")).lower() not in WIN_SHELLS:
+        return False
+    text = re.sub(r"\$env:(\w+)", r"%\1%", " ".join(w[1:]), flags=re.I)
+    text = re.sub(r"(?i)(^|\s)-(literal)?path:", r"\1", text)          # -Path:C:\x is the target C:\x
+    toks = [t.strip("\"'") for t in re.findall(r'"[^"]*"|\'[^\']*\'|[^\s;&|]+', text)]
+
+    def is_flag(a):                                             # -Recurse, -fo; cmd's /s, //q, /a:h
+        return bool(re.fullmatch(r"-\w[\w-]*|//?[a-z?](:\S*)?", a, re.I))
+
+    def expand(a):
+        a = re.sub(r"%(\w+)%", lambda m: os.environ.get(m.group(1), m.group(0)), a)
+        return os.path.expanduser(os.path.expandvars(a))
+
+    base, seen = None, []
+    for k, t in enumerate(toks):
+        low = t.lower()
+        if low in WIN_CD_VERBS:
+            nxt = [a for a in toks[k + 1:k + 3] if not is_flag(a)]
+            if nxt:
+                base = expand(nxt[0])
+            continue
+        if low not in WIN_DELETE_VERBS:
+            seen.append(t)
+            continue
+        args = []
+        for a in toks[k + 1:]:
+            if a.lower() in WIN_DELETE_VERBS or a.lower() in WIN_CD_VERBS:
+                break
+            args.append(a)
+        flags = [a.lower() for a in args if is_flag(a)]
+        recursive = any(re.fullmatch(r"//?s|-r\w*", f) for f in flags)
+        targets = [a for a in args if not is_flag(a)] or [a for a in seen if not is_flag(a)]   # piped in
+        for a in targets:
+            target = re.sub(r"[\\/]+\*?$", "", re.sub(r"[\\/]?\*$", "", expand(a))) or (base or a)
+            if base and not re.match(r"[A-Za-z]:|[\\/~]", target):
+                target = os.path.join(base, target)
+            if _guarded(target, protected) or (recursive and _holds_protected(target, protected)):
+                return True
+        seen = []
     return False
 
 
@@ -434,9 +727,16 @@ def _writes_shell(text, protected):
         dest = extraction_target(seg)
         if dest is not None and (_guarded(dest, protected) or _holds_protected(dest, protected)):
             return True
+        w = command_words(seg) or []
+        if w and os.path.basename(w[0]) in ("rm", "rmdir") and \
+                any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*|--recursive", a) for a in w[1:]) and \
+                any(_holds_protected(a, protected) for a in w[1:] if not a.startswith("-")):
+            return True                                          # rm -r of a folder that holds a protected path
+        if _windows_shell_deletes(w, protected):
+            return True
         if not protected(seg):
             continue
-        if any(_guarded(t, protected) for t in REDIRECTION.findall(seg)):
+        if any(_guarded(t, protected) for t in redirect_targets(seg)):
             return True
         if IN_PLACE.search(seg) or GIT_WRITE.search(seg):
             return True
@@ -1104,4 +1404,28 @@ def bypass(text: str, code: bool = False):
     if code:
         return "Python code that runs a command it computes (exec, eval, shell=True, a non-literal argument list)" \
             if python_hides_execution(text or "", decoding=False) else None
-    return computed_command(text) or hidden_interpreter(text) or indirect_execution(text) or glob_launch(text)
+    return computed_command(text) or hidden_interpreter(text) or indirect_execution(text) or glob_launch(text) or \
+        encoded_powershell(text)
+
+
+ENCODED_FLAG = re.compile(r"[-/]e(c|n[a-z]*)?(:.*)?", re.I)
+
+
+def encoded_powershell(text: str):
+    """Reason if PowerShell is run with its code in base64 (-e, -ec, -enc, -EncodedCommand): nothing can be read."""
+    for seg in segments(text or ""):
+        w = command_words(seg)
+        if w is None:
+            if re.search(r"(^|[\s/\\])(powershell|pwsh)(\.exe)?\s[^\n;&|]*\s[-/]e(c|n[a-z]*)?(\s|:|$)", seg, re.I):
+                return "PowerShell code passed encoded (-EncodedCommand)"
+            continue
+        w = [x for a in w for x in a.split()]                   # cmd //c "powershell -enc ..." is re-read
+        names = [os.path.basename(a.replace("\\", "/")).lower() for a in w]   # also behind cmd //c, start
+        k = next((i for i, n in enumerate(names) if n in ("powershell", "powershell.exe", "pwsh", "pwsh.exe")), -1)
+        if k > 0 and not all(n in ("cmd", "cmd.exe", "start", "start.exe") or a.lower() in ("/c", "//c", "/k", "//k",
+                                                                                         "/b", "//b")
+                             for n, a in zip(names[:k], w[:k])):
+            k = -1                                              # an argument (echo powershell -e), not a program
+        if k >= 0 and any(ENCODED_FLAG.fullmatch(a) for a in w[k + 1:]):
+            return "PowerShell code passed encoded (-EncodedCommand)"
+    return None

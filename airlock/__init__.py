@@ -25,10 +25,11 @@ import time
 
 from . import policy as policy_mod
 from . import rules
+from . import shell
 
 logger = logging.getLogger(__name__)
 PLUGIN = "airlock"
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 AUTHOR = "Otsoa Dubief"
 HERE = os.path.dirname(os.path.abspath(__file__))
 _lock = threading.RLock()
@@ -57,14 +58,14 @@ S = State()
 def _hermes_home():
     try:
         from hermes_constants import get_hermes_home
-        return os.path.realpath(str(get_hermes_home()))
+        return shell.real(str(get_hermes_home()))
     except Exception:
-        return os.path.realpath(os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes"))
+        return shell.real(os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes"))
 
 
 def _hermes_root(home):
     parts = home.rstrip("/").split("/")
-    if len(parts) > 2 and parts[-2] == "profiles":
+    if len(parts) > 2 and parts[-2].lower() == "profiles":
         return "/".join(parts[:-2])
     return home
 
@@ -72,11 +73,11 @@ def _hermes_root(home):
 def _data_dir():
     try:
         from plugins.plugin_storage import plugin_data_dir
-        return os.path.realpath(str(plugin_data_dir(PLUGIN)))
+        return shell.real(str(plugin_data_dir(PLUGIN)))
     except Exception:
         d = os.path.join(_hermes_home(), "plugin-data", PLUGIN)
         os.makedirs(d, exist_ok=True)
-        return os.path.realpath(d)
+        return shell.real(d)
 
 
 def _policy_file():
@@ -86,13 +87,13 @@ def _policy_file():
             path = S.ctx.get_config("policy_file", default=None)
         except Exception:
             path = None
-    return os.path.realpath(os.path.expanduser(path or os.path.join(_hermes_home(), "airlock.yaml")))
+    return shell.real(os.path.expanduser(path or os.path.join(_hermes_home(), "airlock.yaml")))
 
 
 def places():
     home = _hermes_home()
-    return {"home": os.path.realpath(os.path.expanduser("~")), "hermes_home": home, "hermes_root": _hermes_root(home),
-            "plugin_dir": os.path.realpath(HERE), "policy_file": _policy_file(), "data_dir": _data_dir()}
+    return {"home": shell.real(os.path.expanduser("~")), "hermes_home": home, "hermes_root": _hermes_root(home),
+            "plugin_dir": shell.real(HERE), "policy_file": _policy_file(), "data_dir": _data_dir()}
 
 
 def get_policy():
@@ -116,7 +117,7 @@ def _profile():
         return str(S.ctx.profile_name)
     home = _hermes_home()
     parts = home.rstrip("/").split("/")
-    return parts[-1] if len(parts) > 2 and parts[-2] == "profiles" else "default"
+    return parts[-1] if len(parts) > 2 and parts[-2].lower() == "profiles" else "default"
 
 
 def _guarded(pol):
@@ -182,10 +183,10 @@ def origin(tool):
         if not str(module).startswith("hermes_plugins."):
             return "core"
         # Plugins shipped inside Hermes itself are core, not third-party code.
-        bundled = os.path.realpath(os.path.join(os.path.dirname(sys.modules["tools.registry"].__file__), "..",
+        bundled = shell.real(os.path.join(os.path.dirname(sys.modules["tools.registry"].__file__), "..",
                                                 "plugins"))
-        mod_file = os.path.realpath(getattr(sys.modules.get(module), "__file__", "") or "")
-        if mod_file.startswith(bundled + os.sep):
+        mod_file = shell.real(getattr(sys.modules.get(module), "__file__", "") or "")
+        if mod_file.startswith(bundled + "/") or (os.sep != "/" and mod_file.startswith(bundled + os.sep)):
             return "core"
         name = str(module).split(".")[1].split("__home_")[0]
         return f"plugin:{name}"
@@ -516,8 +517,9 @@ def _context(pol, kwargs, tool):
         cwd = str(resolve_agent_cwd())
     except Exception:
         cwd = os.getcwd()
+    cwd = shell.real(cwd) if cwd else cwd
     e = entry(session, pol)
-    return rules.Context(cwd=cwd, home=os.path.realpath(os.path.expanduser("~")), hermes_home=home,
+    return rules.Context(cwd=cwd, home=shell.real(os.path.expanduser("~")), hermes_home=home,
                          hermes_root=_hermes_root(home), profile=_profile(), tainted=e.get("source"),
                          destinations=set(e.get("dest") or ()), locked=e.get("locked"),
                          canary=canary() if pol.canary else None,

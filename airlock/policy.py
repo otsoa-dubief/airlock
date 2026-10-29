@@ -101,6 +101,11 @@ class Policy:
         self.trusted_domains = [str(d).lower().lstrip(".") for d in taint.get("trusted_domains") or []]
         self.untrusted_paths = [p for p in (self._place(x) for x in taint.get("untrusted_paths") or []) if p]
         self.taint_platforms = {str(p).lower() for p in taint.get("platforms") or []}
+        self.context_files = str(taint.get("context_files") or "review").lower()
+        if self.context_files not in ("review", "untrusted_paths"):
+            self.errors.append(f"taint.context_files: {self.context_files!r} is not review or untrusted_paths "
+                               "(review kept)")
+            self.context_files = "review"
         try:
             ttl = float(taint.get("ttl_hours") or 72)
             ttl = ttl if 0 < ttl < 1e6 else 72

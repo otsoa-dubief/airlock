@@ -1010,6 +1010,12 @@ def taint_source(pol, tool, args, ctx):
         if any(under(p, r) for r in pol.untrusted_paths):
             return f"{tool} {p}"[:120]
         return None
+    # Any tool working in an untrusted folder: Hermes appends that folder's AGENTS.md to the tool's result.
+    for key in ("workdir", "path", "file_path"):
+        if isinstance(args.get(key), str) and args[key]:
+            p = shell.normalize(args[key], ctx.cwd)
+            if any(under(p, r) for r in pol.untrusted_paths):
+                return f"{tool} {p}"[:120]
     text = command_text(tool, args) or (str(args.get("code") or "") if tool == "browser_exec" else "")
     if text and pol.untrusted_paths:
         hit = shell.find_cited_path(text, ctx.cwd, lambda p: p if any(under(p, r) for r in pol.untrusted_paths)

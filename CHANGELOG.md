@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.0 — 2026-10-29
+
+- Behavior change: a project's `AGENTS.md`, `CLAUDE.md`, `.cursorrules` or `.hermes.md` that you have not reviewed
+  now seals the session (see below). Review it once per repository with `hermes airlock trust <file>`; the
+  approval message gives the exact command. `taint.context_files: untrusted_paths` keeps the 0.2 behavior.
+- Context files: Hermes loads a project's `AGENTS.md`, `CLAUDE.md`, `.cursorrules` or `.hermes.md` into the
+  system prompt at startup, with no tool call, so airlock never saw it: a cloned repository, or a folder in
+  `~/Downloads`, could steer a session that stayed clean. A session is now sealed from its first turn when such a
+  file has not been reviewed: `hermes airlock trust <file>` records its content after you read it (and lifts the
+  sessions it alone sealed); the file seals again as soon as its content changes, after a pull for instance. Files
+  under `untrusted_paths` cannot be trusted. `taint.context_files: untrusted_paths` keeps the narrower behavior,
+  where only those seal. airlock asks Hermes which files it loads (`discover_context_files`, from both of its
+  context directories, first kind found only); a Hermes without that function seals a session started in an
+  untrusted folder, and a check that fails seals too. The seal is kept with the session: it does not expire while
+  the file sits in the prompt, holds when the conversation is resumed from another folder, and lifts with `/new`,
+  `hermes airlock clear` or `trust`. `trust` releases a session only for the content that session loaded, once
+  every file that sealed it is reviewed and nothing else did (a page read, a lock); subagents, which load no
+  context files, are left to their parent's seal, and a project context Hermes suppresses (its own install tree)
+  is not checked. The agent can neither run `hermes airlock trust` nor call `trust_context` or name
+  `context_trust.json` in a command or in code. Known limit: airlock reads the files just after Hermes does; a
+  process that swaps a file in that instant is not seen. Raised by iLLAdvRoruko on X.
+- Same reason, during the session: a tool whose `workdir`, `path` or `file_path` is in an untrusted folder taints
+  the conversation, since Hermes appends that folder's `AGENTS.md` to the tool's result.
+
 ## 0.2.4 — 2026-10-29
 
 - Security (GHSA-w8j8-5ph5-rrff): on Windows, the walls on folders never matched a path inside them, because

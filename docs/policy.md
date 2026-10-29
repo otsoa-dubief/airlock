@@ -108,6 +108,7 @@ Hermes tools by category (`send_message: message`, `memory: persistence`...), an
 | `source_patterns` | Commands and code that read from the network (`curl https://...`, `git clone`, `requests.get`...) |
 | `trusted_domains` | Reading only from these domains (and their subdomains) does not taint |
 | `untrusted_paths` | Reading files under these paths, with a file tool or a command, taints (`~/Downloads` by default) |
+| `context_files` | `review` (default): a context file Hermes loads at startup (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.hermes.md`) taints until you run `hermes airlock trust <file>`, and again when its content changes. `untrusted_paths`: only those under `untrusted_paths` taint |
 | `platforms` | Conversations on these platforms are tainted from their first message (customer-facing agents) |
 | `ttl_hours` | A taint expires after this long without new untrusted reads (72 by default) |
 

@@ -161,8 +161,8 @@ walls:
       pattern: '\bhermes\b[^\n;&|]*\bplugins?\b[^\n;&|]*\b(disable|remove|rm|uninstall|update)\b[^\n;&|]*\bairlock\b'
       reason: "switching airlock off or changing it is the owner's job, outside the agent"
     - id: airlock-cli
-      pattern: '\bhermes\b[^\n;&|]*\bairlock\s+(resume|clear)\b'
-      reason: "lifting the stop switch or a taint is the owner's decision, made outside the agent"
+      pattern: '\bhermes\b[^\n;&|]*\bairlock\s+(resume|clear|trust)\b|\btrust_context\b|\bcontext_trust\.json\b'
+      reason: "lifting the stop switch or a taint, or trusting a context file, is the owner's decision, made outside the agent"
     - id: credential-cli
       pattern: '\bgh\s+auth\s+(token|status\s+[^\n;&|]*(--show-token|-t)\b)|\bsecurity\s+(find-(generic|internet)-password|dump-keychain)\b|\baws\s+configure\s+(get|export-credentials)\b|\bgcloud\s+auth\s+(print-access-token|print-identity-token)\b|\baz\s+account\s+get-access-token\b|\b(op\s+(read|item\s+get)|pass\s+show|bw\s+get|gopass\s+show|vault\s+(kv\s+)?(read|get))\b|\bgit\s+credential\s+fill\b|\bsecret-tool\s+lookup\b'
       reason: "credentials read through a CLI (tokens, keychain, password manager)"
@@ -314,6 +314,10 @@ taint:
   # Sessions on these platforms start tainted: their messages come from people other than the owner
   # (e.g. [email, whatsapp] for an agent that answers customers).
   platforms: []
+  # Project context files Hermes loads into the prompt at startup (AGENTS.md, CLAUDE.md, .cursorrules, .hermes.md).
+  # review: one you have not reviewed taints the session, until `hermes airlock trust <file>`; it taints again when
+  #   its content changes (a cloned repository, a pull). untrusted_paths: only those under untrusted_paths taint.
+  context_files: review
   # How long a session stays tainted after its last untrusted read, if it is never reset.
   ttl_hours: 72
 

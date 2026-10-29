@@ -19,9 +19,11 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
 import threading
 import time
+from pathlib import Path
 
 from . import policy as policy_mod
 from . import rules
@@ -29,7 +31,7 @@ from . import shell
 
 logger = logging.getLogger(__name__)
 PLUGIN = "airlock"
-__version__ = "0.2.4"
+__version__ = "0.3.0"
 AUTHOR = "Otsoa Dubief"
 HERE = os.path.dirname(os.path.abspath(__file__))
 _lock = threading.RLock()
@@ -48,6 +50,7 @@ class State:
         self.pages = {}           # session -> host of the last page browser_navigate opened
         self.warned_reader = False  # the missing Hermes attachment reader was reported once
         self.reader = None          # Hermes's attachment reader once imported, False when it cannot be
+        self.context_checked = set()  # sessions whose startup context files were already checked
 
 
 S = State()
@@ -247,7 +250,7 @@ def _read_taint(pol):
 def _live(entry, pol):
     """A taint entry still in force. A lock holds until the owner clears it, whatever its age; an unreadable date keeps
     the entry: a hand-edited file must not unseal a session."""
-    if entry.get("locked"):
+    if entry.get("locked") or entry.get("context"):   # a context file stays in the prompt for the whole session
         return True
     try:
         return time.time() - float(entry.get("at", 0)) < pol.taint_ttl
@@ -325,14 +328,17 @@ def tainted(session, pol):
     return entry(session, pol).get("source")
 
 
-def mark(session, source, pol, why="taint"):
+def mark(session, source, pol, why="taint", **extra):
     """Taint a session, and its known ancestors too (a child's findings flow back into its parent)."""
     first = []
 
     def change(s, e):
         if not e.get("source"):
             first.append(s)
-        return {**e, "source": e.get("source") or source, "at": time.time()}
+        sources = list(e.get("sources") or ([e["source"]] if e.get("source") else []))
+        if source not in sources:
+            sources.append(source)
+        return {**e, **extra, "source": e.get("source") or source, "sources": sources[-20:], "at": time.time()}
     _edit(_chain(session), pol, change)
     for s in first:
         journal(pol, {"type": why, "session": s, "source": source})
@@ -509,15 +515,135 @@ def _attachments_reader(pol):
         return None
 
 
-def _context(pol, kwargs, tool):
-    session = session_key(kwargs)
-    home = _hermes_home()
+def _cwd():
     try:
         from agent.runtime_cwd import resolve_agent_cwd
         cwd = str(resolve_agent_cwd())
     except Exception:
         cwd = os.getcwd()
-    cwd = shell.real(cwd) if cwd else cwd
+    return shell.real(cwd) if cwd else cwd
+
+
+def _loaded_context_files(directory):
+    """The project context files Hermes puts in the prompt from `directory`, as (path, content): of the kinds it
+    knows (.hermes.md, AGENTS.md chain, CLAUDE.md, .cursorrules), only the first kind with a non-empty file loads."""
+    from agent.prompt_builder import discover_context_files
+    found = [(kind, path, content) for kind, _label, path, content in discover_context_files(Path(directory))
+             if content]
+    return [(shell.real(str(path)), content) for kind, path, content in found if kind == found[0][0]] if found else []
+
+
+def _ckey(path):
+    """A context file's key: on a case-insensitive filesystem, AGENTS.md and agents.md are one file."""
+    return path.casefold() if shell.CASE_INSENSITIVE_FS else path
+
+
+def _trust_file():
+    return os.path.join(_data_dir(), "context_trust.json")
+
+
+def trusted_contexts():
+    """Context files the owner reviewed: key -> sha256 of the content reviewed."""
+    try:
+        with open(_trust_file(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _digest(content):
+    return hashlib.sha256(content.encode("utf-8", "surrogatepass")).hexdigest()   # content as Hermes read it
+
+
+def trust_context(path, pol):
+    """Record the owner's review of a context file, in its content as it is now. A session it sealed is released
+    only for the content it loaded, and only when nothing else sealed it (another file, a page, a lock): then the
+    session alone is cleared, not its subagents. Returns (path, digest, sessions released); raises ValueError (an
+    untrusted folder, a file that is not UTF-8) or OSError."""
+    p = shell.real(os.path.abspath(os.path.expanduser(path)))
+    if any(rules.under(p, r) for r in pol.untrusted_paths):
+        raise ValueError(f"{p} is under an untrusted path: move it to a folder you trust first")
+    content = Path(p).read_text(encoding="utf-8-sig").strip()     # as Hermes reads it into the prompt
+    digest, key = _digest(content), _ckey(p)
+    with _lock, _FileLock():
+        data = trusted_contexts()
+        data[key] = digest
+        tmp = _trust_file() + f".{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1, sort_keys=True)
+        os.replace(tmp, _trust_file())
+    released = []
+
+    def change(s, e):
+        ctx = dict(e.get("context") or {})
+        if ctx.get(key) != digest:
+            return e
+        ctx.pop(key)
+        others = [x for x in (e.get("sources") or [e.get("source")]) if x and not str(x).startswith("context file")]
+        if not ctx and not others and not e.get("locked"):
+            released.append(s)
+            return {}
+        rest = {k: v for k, v in e.items() if k != "context"}
+        return {**rest, **({"context": ctx} if ctx else {}),
+                "source": e.get("source") if ctx else (others[0] if others else e.get("source"))}
+    sessions = [s for s, e in _read_taint(pol).items() if (e.get("context") or {}).get(key) == digest]
+    if sessions:
+        _edit(sessions, pol, change)
+    journal(pol, {"type": "context_trusted", "path": p, "sha256": digest, "released": released})
+    return p, digest, released
+
+
+def _context_dirs(platform):
+    """The directories Hermes loads project context files from, as _context_files_part does: its context directory
+    with or without the session's override, else the launch directory; none when Hermes suppresses project context
+    (a fallback cwd inside its own install tree). None when this Hermes cannot say."""
+    try:
+        from agent.runtime_cwd import resolve_context_cwd
+    except Exception:
+        return None
+    try:
+        from agent.prompt_builder import _project_context_suppressed
+    except Exception:
+        def _project_context_suppressed(cwd, path, allow):
+            return False
+    out = set()
+    for override in (True, False):
+        cwd = resolve_context_cwd(include_session_override=override)
+        path = Path(cwd if cwd is not None else os.getcwd()).resolve()
+        if not _project_context_suppressed(cwd, path, str(platform or "").lower() in ("cli", "tui")):
+            out.add(str(path))
+    return out
+
+
+def _untrusted_context_files(pol, platform=""):
+    """The project context files Hermes put in the system prompt that must taint, as (path, sha256, why): under an
+    untrusted path, or (context_files: review) not reviewed by the owner in their current content. They reach the
+    model with no tool call, so pre_tool_call never sees them. When Hermes cannot say which files it loads, a
+    working directory under an untrusted path is enough."""
+    try:
+        from agent.prompt_builder import discover_context_files  # noqa: F401
+        dirs = _context_dirs(platform)
+    except Exception:
+        dirs = None
+    if dirs is None:
+        d = _cwd()
+        return [(d, "", "untrusted folder")] if d and any(rules.under(d, r) for r in pol.untrusted_paths) else []
+    trusted = trusted_contexts() if pol.context_files == "review" else {}
+    out = []
+    for p, content in dict(f for d in sorted(dirs) for f in _loaded_context_files(d)).items():
+        sha = _digest(content)
+        if any(rules.under(p, r) for r in pol.untrusted_paths):
+            out.append((p, sha, "untrusted folder"))
+        elif pol.context_files == "review" and trusted.get(_ckey(p)) != sha:
+            out.append((p, sha, "not reviewed"))
+    return out
+
+
+def _context(pol, kwargs, tool):
+    session = session_key(kwargs)
+    home = _hermes_home()
+    cwd = _cwd()
     e = entry(session, pol)
     return rules.Context(cwd=cwd, home=shell.real(os.path.expanduser("~")), hermes_home=home,
                          hermes_root=_hermes_root(home), profile=_profile(), tainted=e.get("source"),
@@ -632,6 +758,11 @@ def pre_tool_call(tool_name="", args=None, **kwargs):
         if d.level == "log":
             return None
         msg = rules.message(d, ctx, ctx.tainted)
+        if "(not reviewed)" in str(ctx.tainted or ""):
+            files = sorted((entry(session, pol).get("context") or {}))[:3]
+            if files:
+                msg += (" The context files Hermes loaded were not reviewed by the owner, who can read them and run: "
+                        + "; ".join(f"hermes airlock trust {shlex.quote(f)}" for f in files) + ".")
         if d.level == "block":
             return {"action": "block", "message": msg}
         return {"action": "approve", "message": msg, "rule_key": rule_key(tool_name, args, d)}
@@ -717,6 +848,24 @@ def pre_llm_call(session_id="", platform="", **kwargs):
         if not _guarded(pol):
             return None
         session = str(session_id or kwargs.get("task_id") or "default")
+        # Context files enter the system prompt when the session starts: check them on this process's first call.
+        # What is found is kept with the session (taint.json), so it outlives the TTL and a resume elsewhere.
+        # A subagent loads none (Hermes skips them for delegated tasks): its parent's seal reaches it.
+        if (session not in S.context_checked and pol.taint_enabled and not kwargs.get("parent_session_id")
+                and (pol.untrusted_paths or pol.context_files == "review")):
+            try:
+                found = _untrusted_context_files(pol, platform)
+            except Exception as e:      # cannot tell what Hermes loaded: seal rather than guess clean
+                logger.warning("airlock: context files could not be checked (%s)", e)
+                found = [("(could not be checked)", "", "error")]
+            S.context_checked.add(session)
+            known = entry(session, pol).get("context") or {}
+            fresh = {_ckey(p): sha for p, sha, _why in found if known.get(_ckey(p)) != sha}
+            if fresh:
+                path, _sha, why = found[0]
+                tail = path if len(path) <= 90 else "…" + path[-89:]     # the file's name is the end
+                more = f" and {len(found) - 1} more" if len(found) > 1 else ""
+                mark(session, f"context file {tail}{more} ({why})", pol, context={**known, **fresh})
         if platform and str(platform).lower() in pol.taint_platforms:
             if not tainted(session, pol):
                 mark(session, f"messages from {platform}", pol)
@@ -769,6 +918,7 @@ def on_session_reset(session_id="", **kwargs):
         pol = get_policy()
         with _lock:
             S.written.pop(str(session_id), None)
+            S.context_checked.discard(str(session_id))   # a new conversation loads the context files again
         clear(str(session_id), pol)
     except Exception:
         logger.exception("airlock: on_session_reset failed")

@@ -31,6 +31,9 @@ def setup(subparser):
     subs.add_parser("resume", help="Stop switch off")
     p = subs.add_parser("clear", help="Clear the taint of a session after reviewing what it read")
     p.add_argument("session")
+    p = subs.add_parser("trust", help="Trust a context file (AGENTS.md, CLAUDE.md...) after reading it; it taints "
+                                      "again if its content changes")
+    p.add_argument("files", nargs="+")
     subs.add_parser("policy", help="The merged policy airlock enforces, and any error in your policy file")
     subs.add_parser("demo", help="Play a prompt-injection attempt against your policy (nothing is executed)")
     subparser.set_defaults(func=run)
@@ -76,6 +79,15 @@ def run(args):
             print("Stop switch OFF.")
     elif sub == "clear":
         print("cleared" if core.clear(args.session, pol) else "that session was not tainted")
+    elif sub == "trust":
+        for f in args.files:
+            try:
+                path, digest, lifted = core.trust_context(f, pol)
+            except (OSError, ValueError) as e:
+                print(f"not trusted: {f}: {e}")
+                continue
+            print(f"trusted: {path} (sha256 {digest[:12]}); it taints again if its content changes"
+                  + (f"; sessions released: {', '.join(lifted)}" if lifted else ""))
     elif sub == "demo":
         demo(core, pol)
     elif sub == "policy":
@@ -164,6 +176,11 @@ def status_text(core, pol, session=None):
     if session:
         src = core.tainted(session, pol)
         lines.append(f"this conversation: {'tainted by ' + src if src else 'clean'}")
+    unreviewed = sorted({k for e in live.values() if "(not reviewed)" in str(e.get("source", ""))
+                         for k in (e.get("context") or {})})
+    if unreviewed:
+        lines.append("context files not reviewed (read them, then `hermes airlock trust <file>`): "
+                     + ", ".join(unreviewed))
     return "\n".join(lines)
 
 

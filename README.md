@@ -22,7 +22,9 @@ it, the post to the webhook waits at Hermes's own approval menu; the owner picks
 ## What it does
 
 - **Seals tainted conversations.** Web pages, browser snapshots, MCP and plugin tool output, `curl`/`git clone`
-  reads, files in `~/Downloads` and (if you say so) messages from customers taint the conversation. From then on, a
+  reads, files in `~/Downloads`, a project's `AGENTS.md`, `CLAUDE.md`, `.cursorrules` or `.hermes.md` that Hermes loads at
+  startup and you have not reviewed (`hermes airlock trust`), and (if you say so) messages from customers taint
+  the conversation. From then on, a
   configurable set of actions needs a human: messages to anyone but you, network writes, pushes and deploys, memory
   and skill writes, scheduled jobs, browser clicks, URLs that could carry data out, handing work to another agent.
   Subagents inherit their parent's taint, and a child's findings taint the parent.
@@ -174,6 +176,7 @@ More in [docs/policy.md](docs/policy.md) and [examples/policies](examples/polici
 | `hermes airlock log` | Last journal entries (`--type block`, `-n 50`) |
 | `hermes airlock stop` / `resume` | Stop switch: every outbound action is blocked until you resume |
 | `hermes airlock clear <session>` | Clear a conversation's taint after you reviewed what it read |
+| `hermes airlock trust <file>` | Trust a context file (`AGENTS.md`, `CLAUDE.md`...) after reading it; it taints again if it changes |
 | `hermes airlock policy` | The merged policy in force, and any error in your file |
 | `/airlock` in a conversation | This conversation's state; `/airlock clear` (owner only) lifts its taint |
 
